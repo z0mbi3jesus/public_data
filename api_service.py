@@ -3152,6 +3152,76 @@ def render_provider_html():
                 <tbody id="purchase-token-rows"></tbody>
             </table>
         </section>
+
+        <section class="panel">
+            <h2 class="section-title">Invite User</h2>
+            <p class="sub" style="margin:0 0 12px">Create a one-time invite link for a new client user. The link opens a password-set page; the user account is created on acceptance.</p>
+            <form id="invite-form">
+                <div class="form-row">
+                    <div>
+                        <label for="invite-email">Email address</label>
+                        <input id="invite-email" type="email" placeholder="user@example.com" required />
+                    </div>
+                    <div>
+                        <label for="invite-tenant-id">Tenant ID</label>
+                        <input id="invite-tenant-id" type="number" placeholder="1" required />
+                    </div>
+                    <div>
+                        <label for="invite-role">Role</label>
+                        <select id="invite-role" class="btn-muted" style="width:100%;padding:7px 10px;border-radius:8px;border:1px solid var(--line)">
+                            <option value="viewer">viewer</option>
+                            <option value="admin">admin</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="invite-expiry">Expires (hours)</label>
+                        <input id="invite-expiry" type="number" value="48" min="1" max="336" />
+                    </div>
+                </div>
+                <div style="margin-top:10px">
+                    <button class="btn-main" type="submit">Create Invite</button>
+                </div>
+            </form>
+            <div id="invite-result" class="new-key-box hidden" style="margin-top:12px"></div>
+        </section>
+
+        <section class="panel">
+            <h2 class="section-title">Password Reset</h2>
+            <p class="sub" style="margin:0 0 12px">Generate a one-time reset link for an existing client user. The link expires after the set number of hours and invalidates all their active sessions on use.</p>
+            <form id="reset-form">
+                <div class="form-row">
+                    <div>
+                        <label for="reset-email">User email</label>
+                        <input id="reset-email" type="email" placeholder="user@example.com" required />
+                    </div>
+                    <div>
+                        <label for="reset-expiry">Expires (hours)</label>
+                        <input id="reset-expiry" type="number" value="24" min="1" max="48" />
+                    </div>
+                </div>
+                <div style="margin-top:10px">
+                    <button class="btn-main" type="submit">Generate Reset Link</button>
+                </div>
+            </form>
+            <div id="reset-result" class="new-key-box hidden" style="margin-top:12px"></div>
+        </section>
+
+        <section class="panel">
+            <h2 class="section-title">Audit Log</h2>
+            <p class="sub" style="margin:0 0 12px">Last 50 security-relevant events. <a href="/admin/audit-log" target="_blank" style="color:var(--blue)">Open full log &rarr;</a></p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time (UTC)</th>
+                        <th>Action</th>
+                        <th>Actor type</th>
+                        <th>Actor</th>
+                        <th>Tenant</th>
+                    </tr>
+                </thead>
+                <tbody id="audit-rows"><tr><td colspan="5">Loading…</td></tr></tbody>
+            </table>
+        </section>
     </main>
 
     <script>
@@ -3472,7 +3542,103 @@ def render_provider_html():
             }
         });
 
+        // ---- Invite ----
+        const inviteForm = document.getElementById('invite-form');
+        const inviteResult = document.getElementById('invite-result');
+        inviteForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            inviteResult.classList.add('hidden');
+            inviteResult.innerHTML = '';
+            setError('');
+            const payload = {
+                email: document.getElementById('invite-email').value.trim(),
+                tenant_id: Number(document.getElementById('invite-tenant-id').value),
+                role: document.getElementById('invite-role').value,
+                expires_hours: Number(document.getElementById('invite-expiry').value || 48)
+            };
+            try {
+                const resp = await fetch('/v1/admin/invites', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.detail || 'Failed to create invite');
+                const link = window.location.origin + data.invite_link;
+                inviteResult.classList.remove('hidden');
+                inviteResult.innerHTML = `
+                    <strong>Invite created for ${data.email}</strong><br>
+                    Role: <strong>${data.role}</strong> &nbsp;|&nbsp; Expires in: <strong>${data.expires_hours}h</strong><br>
+                    <label style="display:block;margin-top:8px;font-size:12px;color:#566372">Invite link (copy and send to the user)</label>
+                    <input type="text" value="${link}" readonly style="width:100%;padding:7px 10px;border-radius:8px;border:1px solid #ccc;font-family:monospace;font-size:12px" onclick="this.select()" />
+                `;
+                inviteForm.reset();
+                document.getElementById('invite-expiry').value = '48';
+                loadAuditLog();
+            } catch (err) {
+                setError(err.message || String(err));
+            }
+        });
+
+        // ---- Password Reset ----
+        const resetForm = document.getElementById('reset-form');
+        const resetResult = document.getElementById('reset-result');
+        resetForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            resetResult.classList.add('hidden');
+            resetResult.innerHTML = '';
+            setError('');
+            const payload = {
+                email: document.getElementById('reset-email').value.trim(),
+                expires_hours: Number(document.getElementById('reset-expiry').value || 24)
+            };
+            try {
+                const resp = await fetch('/v1/admin/password-reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.detail || 'Failed to create reset link');
+                const link = window.location.origin + data.reset_link;
+                resetResult.classList.remove('hidden');
+                resetResult.innerHTML = `
+                    <strong>Reset link for ${data.email}</strong> &nbsp;|&nbsp; Expires in: <strong>${data.expires_hours}h</strong><br>
+                    <label style="display:block;margin-top:8px;font-size:12px;color:#566372">Reset link (copy and send to the user — single use)</label>
+                    <input type="text" value="${link}" readonly style="width:100%;padding:7px 10px;border-radius:8px;border:1px solid #ccc;font-family:monospace;font-size:12px" onclick="this.select()" />
+                `;
+                resetForm.reset();
+                document.getElementById('reset-expiry').value = '24';
+                loadAuditLog();
+            } catch (err) {
+                setError(err.message || String(err));
+            }
+        });
+
+        // ---- Audit log preview ----
+        const auditRows = document.getElementById('audit-rows');
+        async function loadAuditLog() {
+            try {
+                const resp = await fetch('/v1/admin/audit-log');
+                if (!resp.ok) { auditRows.innerHTML = '<tr><td colspan="5">Unauthorized.</td></tr>'; return; }
+                const data = await resp.json();
+                const entries = (data.entries || []).slice(0, 50);
+                if (!entries.length) { auditRows.innerHTML = '<tr><td colspan="5">No entries yet.</td></tr>'; return; }
+                auditRows.innerHTML = entries.map(e => `
+                    <tr>
+                        <td>${formatDate(e.created_at)}</td>
+                        <td><strong>${e.action}</strong></td>
+                        <td>${e.actor_type}</td>
+                        <td>${e.actor_ref || '—'}</td>
+                        <td>${e.tenant_id != null ? '#' + e.tenant_id : '—'}</td>
+                    </tr>`).join('');
+            } catch (err) {
+                auditRows.innerHTML = `<tr><td colspan="5">Error: ${err.message}</td></tr>`;
+            }
+        }
+
         loadProviderDashboard();
+        loadAuditLog();
     </script>
 </body>
 </html>
