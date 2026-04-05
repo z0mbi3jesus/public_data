@@ -201,6 +201,109 @@ def ensure_processed_signal_columns():
         conn.close()
 
 
+def ensure_audit_log_table():
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id          BIGINT        NOT NULL AUTO_INCREMENT,
+                created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                action      VARCHAR(64)   NOT NULL,
+                actor_type  VARCHAR(16)   NOT NULL,
+                actor_ref   VARCHAR(255)  NULL,
+                tenant_id   INT           NULL,
+                details_json JSON         NULL,
+                PRIMARY KEY (id),
+                KEY idx_audit_created (created_at),
+                KEY idx_audit_action  (action),
+                KEY idx_audit_tenant  (tenant_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def ensure_invite_and_reset_tables():
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invite_tokens (
+                id                  BIGINT        NOT NULL AUTO_INCREMENT,
+                created_at          DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at          DATETIME      NOT NULL,
+                email               VARCHAR(255)  NOT NULL,
+                tenant_id           INT           NOT NULL,
+                role                ENUM('admin','viewer') NOT NULL DEFAULT 'viewer',
+                token_hash          VARCHAR(64)   NOT NULL,
+                invited_by_admin_id INT           NOT NULL,
+                used_at             DATETIME      NULL,
+                is_used             TINYINT(1)    NOT NULL DEFAULT 0,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_invite_token_hash (token_hash),
+                KEY idx_invite_tenant  (tenant_id),
+                KEY idx_invite_expires (expires_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id          BIGINT        NOT NULL AUTO_INCREMENT,
+                created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at  DATETIME      NOT NULL,
+                user_id     INT           NOT NULL,
+                token_hash  VARCHAR(64)   NOT NULL,
+                used_at     DATETIME      NULL,
+                is_used     TINYINT(1)    NOT NULL DEFAULT 0,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_pw_reset_token_hash (token_hash),
+                KEY idx_pw_reset_user    (user_id),
+                KEY idx_pw_reset_expires (expires_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def write_audit_log(action, actor_type, actor_ref=None, tenant_id=None, details=None):
+    """
+    Append an audit record. Never raises — audit writes must not break callers.
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO audit_log (action, actor_type, actor_ref, tenant_id, details_json)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    action,
+                    actor_type,
+                    actor_ref,
+                    tenant_id,
+                    json.dumps(details) if details is not None else None,
+                ),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+    except Exception:
+        pass
+
+
 def hash_api_key(raw_key):
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
@@ -664,6 +767,28 @@ class AdminKeyRevokePayload(BaseModel):
     key_prefix: str
 
 
+class InviteCreatePayload(BaseModel):
+    email: str
+    tenant_id: int
+    role: str = "viewer"
+    expires_hours: int = 48
+
+
+class InviteAcceptPayload(BaseModel):
+    token: str
+    password: str
+
+
+class PasswordResetCreatePayload(BaseModel):
+    email: str
+    expires_hours: int = 24
+
+
+class PasswordResetUsePayload(BaseModel):
+    token: str
+    new_password: str
+
+
 def create_tenant(payload: ProviderTenantCreate):
     normalized_plan = payload.plan_tier.lower().strip()
     if normalized_plan not in {"trial", "basic", "pro", "enterprise"}:
@@ -705,6 +830,11 @@ def create_tenant(payload: ProviderTenantCreate):
         )
 
         conn.commit()
+        write_audit_log(
+            "tenant_created", "admin",
+            tenant_id=tenant_id,
+            details={"tenant_name": payload.name.strip(), "plan_tier": normalized_plan, "entitlements": normalized_ents},
+        )
         return {
             "tenant_id": tenant_id,
             "tenant_name": payload.name.strip(),
@@ -744,6 +874,7 @@ def login_admin(payload: LoginPayload):
             (row["id"], session_hash),
         )
         conn.commit()
+        write_audit_log("admin_login", "admin", actor_ref=row["email"], details={"admin_user_id": row["id"]})
         return {
             "session": raw_session,
             "admin_user_id": row["id"],
@@ -783,6 +914,7 @@ def login_client(payload: LoginPayload):
             (row["id"], row["tenant_id"], session_hash),
         )
         conn.commit()
+        write_audit_log("client_login", "client", actor_ref=row["email"], tenant_id=row["tenant_id"], details={"user_id": row["id"]})
         return {
             "session": raw_session,
             "user_id": row["id"],
@@ -843,6 +975,11 @@ def create_purchase_token(payload: PurchaseTokenCreatePayload):
         )
         token_id = cur.lastrowid
         conn.commit()
+        write_audit_log(
+            "purchase_token_created", "admin",
+            tenant_id=payload.tenant_id,
+            details={"plan_tier": plan_tier, "entitlements": entitlements, "expires_hours": expires_hours},
+        )
         return {
             "id": token_id,
             "tenant_id": payload.tenant_id,
@@ -955,6 +1092,12 @@ def redeem_purchase_token(context, payload: PurchaseTokenRedeemPayload):
         )
 
         conn.commit()
+        write_audit_log(
+            "purchase_token_redeemed", "client",
+            actor_ref=context.get("email"),
+            tenant_id=context["tenant_id"],
+            details={"plan_tier": row["plan_tier"], "entitlements": entitlements},
+        )
         return {
             "tenant_id": context["tenant_id"],
             "tenant_name": context["tenant_name"],
@@ -1020,6 +1163,11 @@ def create_api_key_for_tenant(tenant_id, label, deactivate_existing=False):
             (tenant_id, hash_secret(raw_api_key), raw_api_key[:8], label.strip() or "rotated-key"),
         )
         conn.commit()
+        write_audit_log(
+            "api_key_created", "system",
+            tenant_id=tenant_id,
+            details={"label": label.strip() or "rotated-key", "deactivated_existing": bool(deactivate_existing)},
+        )
         return {
             "tenant_id": tenant_id,
             "api_key": raw_api_key,
@@ -1047,6 +1195,7 @@ def revoke_api_key_by_prefix(tenant_id, key_prefix):
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="No matching key for tenant")
         conn.commit()
+        write_audit_log("api_key_revoked", "system", tenant_id=tenant_id, details={"key_prefix": prefix})
         return {
             "tenant_id": tenant_id,
             "key_prefix": prefix,
@@ -1067,10 +1216,291 @@ def set_tenant_active(tenant_id, active):
         if not active:
             cur.execute("UPDATE api_keys SET active = 0 WHERE tenant_id = %s", (tenant_id,))
         conn.commit()
+        write_audit_log(
+            "tenant_status_changed", "admin",
+            tenant_id=tenant_id,
+            details={"active": bool(active)},
+        )
         return {
             "tenant_id": tenant_id,
             "active": bool(active),
         }
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Invite flow
+# ---------------------------------------------------------------------------
+
+def create_invite(admin_context, payload: InviteCreatePayload):
+    role = payload.role.lower().strip()
+    if role not in {"admin", "viewer"}:
+        raise HTTPException(status_code=400, detail="role must be admin or viewer")
+    email = str(payload.email).lower().strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    expires_hours = max(1, min(int(payload.expires_hours), 24 * 14))
+
+    raw_token = f"inv_{secrets.token_urlsafe(32)}"
+    token_hash = hash_secret(raw_token)
+
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute("SELECT id FROM tenants WHERE id = %s", (payload.tenant_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+        if cur.fetchone():
+            raise HTTPException(status_code=409, detail="A user with that email already exists")
+
+        cur.execute(
+            """
+            INSERT INTO invite_tokens
+                (email, tenant_id, role, token_hash, invited_by_admin_id, expires_at)
+            VALUES (%s, %s, %s, %s, %s, DATE_ADD(NOW(), INTERVAL %s HOUR))
+            """,
+            (email, payload.tenant_id, role, token_hash, admin_context["admin_user_id"], expires_hours),
+        )
+        conn.commit()
+        write_audit_log(
+            "invite_created", "admin",
+            actor_ref=admin_context.get("email"),
+            tenant_id=payload.tenant_id,
+            details={"invite_email": email, "role": role, "expires_hours": expires_hours},
+        )
+        return {
+            "email": email,
+            "tenant_id": payload.tenant_id,
+            "role": role,
+            "expires_hours": expires_hours,
+            "invite_link": f"/auth/accept-invite?token={raw_token}",
+            "raw_token": raw_token,
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+def list_invites():
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            """
+            SELECT it.id, it.created_at, it.expires_at, it.email, it.tenant_id,
+                   it.role, it.is_used, it.used_at, t.name AS tenant_name
+            FROM invite_tokens it
+            JOIN tenants t ON t.id = it.tenant_id
+            ORDER BY it.created_at DESC
+            LIMIT 200
+            """
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": row["id"],
+                "email": row["email"],
+                "tenant_id": row["tenant_id"],
+                "tenant_name": row["tenant_name"],
+                "role": row["role"],
+                "is_used": bool(row["is_used"]),
+                "used_at": serialize_dt(row["used_at"]),
+                "created_at": serialize_dt(row["created_at"]),
+                "expires_at": serialize_dt(row["expires_at"]),
+            }
+            for row in rows
+        ]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def accept_invite(payload: InviteAcceptPayload):
+    token_str = (payload.token or "").strip()
+    if not token_str:
+        raise HTTPException(status_code=400, detail="token is required")
+    password = payload.password or ""
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    token_hash = hash_secret(token_str)
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            "SELECT * FROM invite_tokens WHERE token_hash = %s",
+            (token_hash,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Invite token not found")
+        if row["is_used"]:
+            raise HTTPException(status_code=409, detail="Invite already used")
+        if isinstance(row["expires_at"], datetime) and row["expires_at"] < datetime.utcnow():
+            raise HTTPException(status_code=410, detail="Invite token expired")
+
+        email = row["email"]
+        tenant_id = row["tenant_id"]
+        role = row["role"]
+
+        cur.execute(
+            """
+            INSERT INTO users (tenant_id, email, password_hash, role, active)
+            VALUES (%s, %s, %s, %s, 1)
+            """,
+            (tenant_id, email, hash_password(password), role),
+        )
+        cur.execute(
+            "UPDATE invite_tokens SET is_used = 1, used_at = NOW() WHERE id = %s",
+            (row["id"],),
+        )
+        conn.commit()
+        write_audit_log(
+            "invite_accepted", "client",
+            actor_ref=email,
+            tenant_id=tenant_id,
+            details={"role": role},
+        )
+        return {"email": email, "tenant_id": tenant_id, "role": role}
+    except mysql.connector.Error as err:
+        conn.rollback()
+        if getattr(err, "errno", None) == 1062:
+            raise HTTPException(status_code=409, detail="A user with that email already exists")
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Password reset flow
+# ---------------------------------------------------------------------------
+
+def admin_trigger_password_reset(admin_context, payload: PasswordResetCreatePayload):
+    email = str(payload.email).lower().strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    expires_hours = max(1, min(int(payload.expires_hours), 48))
+
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute("SELECT id, email, active FROM users WHERE email = %s", (email,))
+        user = cur.fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        if not user["active"]:
+            raise HTTPException(status_code=409, detail="User is inactive")
+
+        raw_token = f"rst_{secrets.token_urlsafe(32)}"
+        token_hash = hash_secret(raw_token)
+
+        cur.execute(
+            """
+            INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+            VALUES (%s, %s, DATE_ADD(NOW(), INTERVAL %s HOUR))
+            """,
+            (user["id"], token_hash, expires_hours),
+        )
+        conn.commit()
+        write_audit_log(
+            "password_reset_created", "admin",
+            actor_ref=admin_context.get("email"),
+            details={"target_email": email, "expires_hours": expires_hours},
+        )
+        return {
+            "email": email,
+            "expires_hours": expires_hours,
+            "reset_link": f"/auth/reset-password?token={raw_token}",
+            "raw_token": raw_token,
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+def use_password_reset(payload: PasswordResetUsePayload):
+    token_str = (payload.token or "").strip()
+    if not token_str:
+        raise HTTPException(status_code=400, detail="token is required")
+    new_password = payload.new_password or ""
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    token_hash = hash_secret(token_str)
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute("SELECT * FROM password_reset_tokens WHERE token_hash = %s", (token_hash,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Reset token not found")
+        if row["is_used"]:
+            raise HTTPException(status_code=409, detail="Reset token already used")
+        if isinstance(row["expires_at"], datetime) and row["expires_at"] < datetime.utcnow():
+            raise HTTPException(status_code=410, detail="Reset token expired")
+
+        cur.execute(
+            "UPDATE users SET password_hash = %s WHERE id = %s",
+            (hash_password(new_password), row["user_id"]),
+        )
+        cur.execute(
+            "UPDATE password_reset_tokens SET is_used = 1, used_at = NOW() WHERE id = %s",
+            (row["id"],),
+        )
+        # Invalidate all active client sessions for this user
+        cur.execute("DELETE FROM client_sessions WHERE user_id = %s", (row["user_id"],))
+        conn.commit()
+        write_audit_log(
+            "password_reset_used", "client",
+            details={"user_id": row["user_id"]},
+        )
+        return {"ok": True}
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Audit log fetch
+# ---------------------------------------------------------------------------
+
+def fetch_audit_log(limit=200):
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            """
+            SELECT id, created_at, action, actor_type, actor_ref, tenant_id, details_json
+            FROM audit_log
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+        result = []
+        for row in rows:
+            details = row.get("details_json")
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details)
+                except Exception:
+                    details = {}
+            result.append({
+                "id": row["id"],
+                "created_at": serialize_dt(row["created_at"]),
+                "action": row["action"],
+                "actor_type": row["actor_type"],
+                "actor_ref": row["actor_ref"],
+                "tenant_id": row["tenant_id"],
+                "details": details,
+            })
+        return result
     finally:
         cur.close()
         conn.close()
@@ -1225,6 +1655,196 @@ def build_dashboard_summary(context):
         "trends": trends,
         "stream_health": fetch_stream_health(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Auth HTML pages  (accept-invite, reset-password)
+# ---------------------------------------------------------------------------
+
+def render_accept_invite_html(token: str = ""):
+    safe_token = token.replace('"', "").replace("'", "").replace("<", "").replace(">", "")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Accept Invite – Public Data</title>
+<style>
+body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+     font-family:system-ui,sans-serif;background:#f5efe4;color:#1e2a25}}
+.card{{background:#fff;border-radius:18px;padding:40px 36px;width:340px;
+       box-shadow:0 12px 40px rgba(0,0,0,.12)}}
+h2{{margin:0 0 6px;font-size:1.3rem}}
+p{{margin:0 0 20px;font-size:.85rem;color:#5f6b64}}
+label{{display:block;font-size:.82rem;font-weight:600;margin-bottom:4px;color:#1e2a25}}
+input{{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;
+       border-radius:9px;font-size:.95rem;margin-bottom:16px}}
+button{{width:100%;padding:11px;background:#0f766e;color:#fff;border:none;
+        border-radius:9px;font-size:1rem;cursor:pointer;font-weight:600}}
+button:hover{{background:#0d6057}}
+#msg{{margin-top:14px;font-size:.85rem;text-align:center;color:#b7412b}}
+#ok{{margin-top:14px;font-size:.85rem;text-align:center;color:#1f7a3d;display:none}}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Set your password</h2>
+  <p>You've been invited to access the Public Data platform. Choose a password to activate your account.</p>
+  <label>Password</label>
+  <input type="password" id="pw" placeholder="At least 8 characters">
+  <label>Confirm password</label>
+  <input type="password" id="pw2" placeholder="Repeat password">
+  <button onclick="submit()">Activate account</button>
+  <div id="msg"></div>
+  <div id="ok">Account activated! <a href="/client/login">Sign in &rarr;</a></div>
+</div>
+<script>
+const TOKEN = "{safe_token}";
+async function submit() {{
+  const pw = document.getElementById("pw").value;
+  const pw2 = document.getElementById("pw2").value;
+  const msg = document.getElementById("msg");
+  if (pw !== pw2) {{ msg.textContent = "Passwords do not match."; return; }}
+  if (pw.length < 8) {{ msg.textContent = "Password must be at least 8 characters."; return; }}
+  msg.textContent = "";
+  const r = await fetch("/v1/auth/accept-invite", {{
+    method: "POST",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{token: TOKEN, password: pw}})
+  }});
+  if (r.ok) {{
+    document.getElementById("ok").style.display = "block";
+    document.querySelector("button").disabled = true;
+  }} else {{
+    const d = await r.json();
+    msg.textContent = d.detail || "Error activating account.";
+  }}
+}}
+</script>
+</body>
+</html>"""
+
+
+def render_reset_password_html(token: str = ""):
+    safe_token = token.replace('"', "").replace("'", "").replace("<", "").replace(">", "")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reset Password – Public Data</title>
+<style>
+body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+     font-family:system-ui,sans-serif;background:#f5efe4;color:#1e2a25}}
+.card{{background:#fff;border-radius:18px;padding:40px 36px;width:340px;
+       box-shadow:0 12px 40px rgba(0,0,0,.12)}}
+h2{{margin:0 0 6px;font-size:1.3rem}}
+p{{margin:0 0 20px;font-size:.85rem;color:#5f6b64}}
+label{{display:block;font-size:.82rem;font-weight:600;margin-bottom:4px;color:#1e2a25}}
+input{{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;
+       border-radius:9px;font-size:.95rem;margin-bottom:16px}}
+button{{width:100%;padding:11px;background:#0f766e;color:#fff;border:none;
+        border-radius:9px;font-size:1rem;cursor:pointer;font-weight:600}}
+button:hover{{background:#0d6057}}
+#msg{{margin-top:14px;font-size:.85rem;text-align:center;color:#b7412b}}
+#ok{{margin-top:14px;font-size:.85rem;text-align:center;color:#1f7a3d;display:none}}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Reset your password</h2>
+  <p>Enter a new password for your account. All active sessions will be signed out.</p>
+  <label>New password</label>
+  <input type="password" id="pw" placeholder="At least 8 characters">
+  <label>Confirm new password</label>
+  <input type="password" id="pw2" placeholder="Repeat password">
+  <button onclick="submit()">Reset password</button>
+  <div id="msg"></div>
+  <div id="ok">Password reset! <a href="/client/login">Sign in &rarr;</a></div>
+</div>
+<script>
+const TOKEN = "{safe_token}";
+async function submit() {{
+  const pw = document.getElementById("pw").value;
+  const pw2 = document.getElementById("pw2").value;
+  const msg = document.getElementById("msg");
+  if (pw !== pw2) {{ msg.textContent = "Passwords do not match."; return; }}
+  if (pw.length < 8) {{ msg.textContent = "Password must be at least 8 characters."; return; }}
+  msg.textContent = "";
+  const r = await fetch("/v1/auth/reset-password", {{
+    method: "POST",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{token: TOKEN, new_password: pw}})
+  }});
+  if (r.ok) {{
+    document.getElementById("ok").style.display = "block";
+    document.querySelector("button").disabled = true;
+  }} else {{
+    const d = await r.json();
+    msg.textContent = d.detail || "Error resetting password.";
+  }}
+}}
+</script>
+</body>
+</html>"""
+
+
+def render_audit_log_html():
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Audit Log – Public Data Admin</title>
+<style>
+body{margin:0;font-family:system-ui,sans-serif;background:#f5efe4;color:#1e2a25}
+.shell{max-width:1100px;margin:28px auto;padding:0 16px}
+h2{margin:0 0 18px;font-size:1.3rem}
+a{color:#0f766e;text-decoration:none;font-size:.85rem}
+table{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;
+      overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08);font-size:.82rem}
+thead{background:#0f766e;color:#fff}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid #f0ece4}
+tr:last-child td{border-bottom:none}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:.72rem;font-weight:700}
+.admin{background:#e8f5f3;color:#0f766e}
+.client{background:#fef8ec;color:#b8691c}
+.system{background:#eef;color:#444}
+</style>
+</head>
+<body>
+<div class="shell">
+  <p><a href="/admin">&larr; Back to Admin</a></p>
+  <h2>Audit Log</h2>
+  <table id="tbl">
+    <thead><tr>
+      <th>Time (UTC)</th><th>Action</th><th>Actor type</th>
+      <th>Actor</th><th>Tenant</th><th>Details</th>
+    </tr></thead>
+    <tbody id="tbody"><tr><td colspan="6">Loading…</td></tr></tbody>
+  </table>
+</div>
+<script>
+async function load() {
+  const r = await fetch("/v1/admin/audit-log", {credentials:"include"});
+  if (!r.ok) { document.getElementById("tbody").innerHTML = "<tr><td colspan='6'>Unauthorized or error.</td></tr>"; return; }
+  const data = await r.json();
+  const rows = data.entries || [];
+  if (!rows.length) { document.getElementById("tbody").innerHTML = "<tr><td colspan='6'>No entries yet.</td></tr>"; return; }
+  document.getElementById("tbody").innerHTML = rows.map(e => `
+    <tr>
+      <td>${e.created_at || ""}</td>
+      <td><strong>${e.action}</strong></td>
+      <td><span class="badge ${e.actor_type}">${e.actor_type}</span></td>
+      <td>${e.actor_ref || "—"}</td>
+      <td>${e.tenant_id != null ? "#" + e.tenant_id : "—"}</td>
+      <td><code style="font-size:.72rem">${e.details ? JSON.stringify(e.details) : "—"}</code></td>
+    </tr>`).join("");
+}
+load();
+</script>
+</body>
+</html>"""
 
 
 def render_dashboard_html():
@@ -3327,6 +3947,14 @@ def render_admin_console_html():
         return render_provider_html()
 
 
+def _secure_cookies() -> bool:
+    """Return True when the app is configured to run behind HTTPS."""
+    try:
+        return bool(load_config().get("web", {}).get("secure_cookies", False))
+    except Exception:
+        return False
+
+
 app = FastAPI(title="Public Data API", version="0.1.0")
 
 
@@ -3335,6 +3963,8 @@ def on_startup():
     ensure_processed_signal_columns()
     ensure_auth_tables()
     ensure_admin_bootstrap_user()
+    ensure_audit_log_table()
+    ensure_invite_and_reset_tables()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -3430,8 +4060,8 @@ def admin_login(payload: LoginPayload, response: Response):
         key="admin_session",
         value=result["session"],
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="strict",
+        secure=_secure_cookies(),
         max_age=60 * 60 * 12,
     )
     return {
@@ -3514,8 +4144,8 @@ def client_login(payload: LoginPayload, response: Response):
         key="client_session",
         value=result["session"],
         httponly=True,
-        samesite="lax",
-        secure=False,
+        samesite="strict",
+        secure=_secure_cookies(),
         max_age=60 * 60 * 12,
     )
     return {
@@ -3598,3 +4228,66 @@ def system_stream_health(context=Depends(get_request_context)):
         "tenant": context,
         "data": fetch_stream_health(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Admin — invites
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/admin/invites")
+def admin_create_invite(payload: InviteCreatePayload, context=Depends(get_admin_context)):
+    return create_invite(context, payload)
+
+
+@app.get("/v1/admin/invites")
+def admin_list_invites(context=Depends(get_admin_context)):
+    _ = context
+    return {"invites": list_invites()}
+
+
+# ---------------------------------------------------------------------------
+# Admin — password reset trigger
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/admin/password-reset")
+def admin_create_password_reset(payload: PasswordResetCreatePayload, context=Depends(get_admin_context)):
+    return admin_trigger_password_reset(context, payload)
+
+
+# ---------------------------------------------------------------------------
+# Admin — audit log
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/admin/audit-log")
+def admin_audit_log(context=Depends(get_admin_context)):
+    _ = context
+    return {"entries": fetch_audit_log(limit=500)}
+
+
+@app.get("/admin/audit-log", response_class=HTMLResponse)
+def admin_audit_log_page():
+    return render_audit_log_html()
+
+
+# ---------------------------------------------------------------------------
+# Public auth pages (invite acceptance, password reset)
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/accept-invite", response_class=HTMLResponse)
+def accept_invite_page(token: str = ""):
+    return render_accept_invite_html(token)
+
+
+@app.post("/v1/auth/accept-invite")
+def do_accept_invite(payload: InviteAcceptPayload):
+    return accept_invite(payload)
+
+
+@app.get("/auth/reset-password", response_class=HTMLResponse)
+def reset_password_page(token: str = ""):
+    return render_reset_password_html(token)
+
+
+@app.post("/v1/auth/reset-password")
+def do_reset_password(payload: PasswordResetUsePayload):
+    return use_password_reset(payload)

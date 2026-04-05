@@ -153,6 +153,66 @@ TABLES = {
             KEY `idx_sh_checked_at` (`checked_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """,
+
+    # ------------------------------------------------------------------
+    # audit_log — append-only record of security-relevant actions.
+    # ------------------------------------------------------------------
+    "audit_log": """
+        CREATE TABLE IF NOT EXISTS `audit_log` (
+            `id`          BIGINT        NOT NULL AUTO_INCREMENT,
+            `created_at`  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `action`      VARCHAR(64)   NOT NULL,
+            `actor_type`  VARCHAR(16)   NOT NULL COMMENT 'admin | client | provider | system',
+            `actor_ref`   VARCHAR(255)  NULL     COMMENT 'email or identifier of the actor',
+            `tenant_id`   INT           NULL,
+            `details_json` JSON         NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_audit_created` (`created_at`),
+            KEY `idx_audit_action` (`action`),
+            KEY `idx_audit_tenant` (`tenant_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+
+    # ------------------------------------------------------------------
+    # invite_tokens — admin-issued one-time links to create client users.
+    # ------------------------------------------------------------------
+    "invite_tokens": """
+        CREATE TABLE IF NOT EXISTS `invite_tokens` (
+            `id`                  BIGINT        NOT NULL AUTO_INCREMENT,
+            `created_at`          DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `expires_at`          DATETIME      NOT NULL,
+            `email`               VARCHAR(255)  NOT NULL,
+            `tenant_id`           INT           NOT NULL,
+            `role`                ENUM('admin','viewer') NOT NULL DEFAULT 'viewer',
+            `token_hash`          VARCHAR(64)   NOT NULL,
+            `invited_by_admin_id` INT           NOT NULL,
+            `used_at`             DATETIME      NULL,
+            `is_used`             TINYINT(1)    NOT NULL DEFAULT 0,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_invite_token_hash` (`token_hash`),
+            KEY `idx_invite_tenant` (`tenant_id`),
+            KEY `idx_invite_expires` (`expires_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+
+    # ------------------------------------------------------------------
+    # password_reset_tokens — admin-issued one-time password reset links.
+    # ------------------------------------------------------------------
+    "password_reset_tokens": """
+        CREATE TABLE IF NOT EXISTS `password_reset_tokens` (
+            `id`         BIGINT        NOT NULL AUTO_INCREMENT,
+            `created_at` DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `expires_at` DATETIME      NOT NULL,
+            `user_id`    INT           NOT NULL,
+            `token_hash` VARCHAR(64)   NOT NULL,
+            `used_at`    DATETIME      NULL,
+            `is_used`    TINYINT(1)    NOT NULL DEFAULT 0,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_pw_reset_token_hash` (`token_hash`),
+            KEY `idx_pw_reset_user` (`user_id`),
+            KEY `idx_pw_reset_expires` (`expires_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
 }
 
 # Tables must be created in this order to satisfy foreign key dependencies
@@ -164,6 +224,9 @@ CREATE_ORDER = [
     "raw_events",
     "processed_signals",
     "stream_health",
+    "audit_log",
+    "invite_tokens",
+    "password_reset_tokens",
 ]
 
 
