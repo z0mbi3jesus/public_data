@@ -1,0 +1,63 @@
+{
+  "storage": {
+    "type": "mysql",
+    "mysql": {
+      "host": "127.0.0.1",
+      "port": 3306,
+      "database": "public_data",
+      "user": "your_mysql_user",
+      "password": "YOUR_MYSQL_PASSWORD",
+      "ssl_disabled": true
+    },
+    "sqlite": {
+      "db_path": "public_data.db"
+    }
+  },
+  "provider": {
+    "owner_name": "Public Data Provider",
+    "key": "YOUR_PROVIDER_KEY"
+  },
+  "admin": {
+    "bootstrap_email": "admin@example.com",
+    "bootstrap_password": "CHANGE_ME_STRONG_PASSWORD"
+  },
+  "streams": {
+    "air_quality": {
+      "enabled": true,
+      "api_url": "https://www.airnowapi.org/aq/observation/zipCode/current/",
+      "zip": "97224",
+      "key": "YOUR_AIRNOW_KEY"
+    },
+    "weather": {
+      "enabled": true,
+      "api_url": "http://api.weatherapi.com/v1/current.json",
+      "city": "Portland,US",
+      "key": "YOUR_WEATHERAPI_KEY"
+    },
+    "traffic": {
+      "enabled": true,
+      "api_url": "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json",
+      "key": "YOUR_TOMTOM_KEY",
+      "points": [
+        {"label": "Downtown", "coords": "45.52,-122.68"},
+        {"label": "Airport", "coords": "45.5898,-122.5951"},
+        {"label": "North Portland", "coords": "45.58,-122.69"},
+        {"label": "Southeast Portland", "coords": "45.50,-122.64"},
+        {"label": "West Hills", "coords": "45.52,-122.74"}
+      ]
+    },
+    "airport": {
+      "enabled": true,
+      "api_url": "https://api.aviationstack.com/v1/flights",
+      "key": "YOUR_AVIATIONSTACK_KEY",
+      "reference_csv": "data/airports.csv",
+      "key_param": "access_key",
+      "airport_param": "dep_iata",
+      "airports": ["PDX"],
+      "params": {
+        "limit": 50
+      },
+      "timeout_sec": 20
+    }
+  }
+}

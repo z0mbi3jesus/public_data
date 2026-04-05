@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+
+# Logs and runtime outputs
+*.log
+nohup.out
+output.log
+
+# Local secrets (never commit)
+config.local.json
+credentials.local.json
+.env
+.env.*
+
+# Keep public examples tracked
+!config.example.json
+!credentials.example.json
