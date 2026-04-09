@@ -51,6 +51,7 @@
       "api_url": "https://api.aviationstack.com/v1/flights",
       "key": "YOUR_AVIATIONSTACK_KEY",
       "reference_csv": "data/airports.csv",
+      "min_interval_minutes": 240,
       "key_param": "access_key",
       "airport_param": "dep_iata",
       "airports": ["PDX"],

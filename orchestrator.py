@@ -80,6 +80,54 @@ def param_placeholder(count):
     marker = '%s' if get_storage_type() == 'mysql' else '?'
     return ', '.join([marker] * count)
 
+
+def _stream_min_interval_minutes(stream_config):
+    try:
+        value = int(stream_config.get('min_interval_minutes', 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
+
+
+def _parse_logged_timestamp(raw_value):
+    if raw_value is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw_value).replace('Z', '+00:00')).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def should_run_stream(conn, stream_name, stream_config):
+    min_interval = _stream_min_interval_minutes(stream_config)
+    if min_interval <= 0:
+        return True, 0
+
+    sql = (
+        'SELECT timestamp FROM master_log WHERE stream_name = %s '
+        'ORDER BY id DESC LIMIT 1'
+        if get_storage_type() == 'mysql'
+        else 'SELECT timestamp FROM master_log WHERE stream_name = ? ORDER BY id DESC LIMIT 1'
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, (stream_name,))
+        row = cur.fetchone()
+    finally:
+        cur.close()
+
+    last_attempt = _parse_logged_timestamp(row[0] if row else None)
+    if last_attempt is None:
+        return True, 0
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    elapsed_minutes = (now - last_attempt).total_seconds() / 60
+    if elapsed_minutes >= min_interval:
+        return True, 0
+
+    remaining = max(1, int(min_interval - elapsed_minutes))
+    return False, remaining
+
 def ensure_master_log_table(conn):
     if get_storage_type() == 'mysql':
         conn.cursor().execute(
@@ -189,6 +237,16 @@ def run_orchestrator():
     # Iterate enabled streams
     for stream_name, stream_config in config['streams'].items():
         if stream_config.get('enabled'):
+            should_run, retry_in_min = should_run_stream(conn, stream_name, stream_config)
+            if not should_run:
+                print(f"[SKIP] Stream '{stream_name}' throttled; next attempt in about {retry_in_min} min.")
+                logging.info(
+                    "Stream '%s' throttled by min_interval_minutes=%s; retry in %s min.",
+                    stream_name,
+                    stream_config.get('min_interval_minutes'),
+                    retry_in_min,
+                )
+                continue
             try:
                 module = importlib.import_module(f"modules.{stream_name}_module")
                 fetch_func = getattr(module, f"fetch_{stream_name}")

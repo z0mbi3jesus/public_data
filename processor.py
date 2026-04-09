@@ -45,6 +45,8 @@ STREAM_TABLES = {
     "weather":     "stream_weather",
     "traffic":     "stream_traffic",
     "airport":     "stream_airport",
+    "opensky":     "stream_opensky",
+    "purpleair":   "stream_purpleair",
 }
 
 # Which field carries the location label for each stream
@@ -53,7 +55,17 @@ STREAM_LOCATION_FIELD = {
     "weather":     "location",
     "traffic":     "location",
     "airport":     "airport_code",
+    "opensky":     "location",
+    "purpleair":   "location",
 }
+
+
+def _table_exists(conn, table_name):
+    cur = conn.cursor()
+    cur.execute("SHOW TABLES LIKE %s", (table_name,))
+    row = cur.fetchone()
+    cur.close()
+    return row is not None
 
 
 # ── Cursor table (tracks last normalized stream row id) ───────────────────────
@@ -114,6 +126,9 @@ def normalize_stream(conn, stream_name):
     """Copy new rows from a stream table into raw_events with JSON payloads."""
     table = STREAM_TABLES.get(stream_name)
     if not table:
+        return 0
+    if not _table_exists(conn, table):
+        # Stream may be disabled and never ingested yet.
         return 0
 
     last_id = _get_cursor(conn, stream_name)
@@ -517,6 +532,8 @@ def update_stream_health(conn):
     checked_at = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
     for stream_name, table in STREAM_TABLES.items():
         try:
+            if not _table_exists(conn, table):
+                continue
             cur = conn.cursor()
             cur.execute(f"SELECT MAX(`ingested_at`) FROM `{table}`")
             row = cur.fetchone()

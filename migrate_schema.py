@@ -213,6 +213,136 @@ TABLES = {
             KEY `idx_pw_reset_expires` (`expires_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """,
+
+    # ------------------------------------------------------------------
+    # nws_alerts — structured store for active NWS weather alerts.
+    # Populated by the analytics processor from raw stream_weather rows.
+    # ------------------------------------------------------------------
+    "nws_alerts": """
+        CREATE TABLE IF NOT EXISTS `nws_alerts` (
+            `id`           BIGINT        NOT NULL AUTO_INCREMENT,
+            `fetched_at`   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `location_lat` DECIMAL(8,4)  NOT NULL,
+            `location_lon` DECIMAL(8,4)  NOT NULL,
+            `alert_id`     VARCHAR(255)  NULL     COMMENT 'NWS URN identifier',
+            `event`        VARCHAR(128)  NOT NULL COMMENT 'e.g. Winter Storm Warning',
+            `severity`     VARCHAR(32)   NOT NULL COMMENT 'Extreme/Severe/Moderate/Minor/Unknown',
+            `urgency`      VARCHAR(32)   NOT NULL COMMENT 'Immediate/Expected/Future/Past/Unknown',
+            `certainty`    VARCHAR(32)   NOT NULL COMMENT 'Observed/Likely/Possible/Unlikely/Unknown',
+            `status`       VARCHAR(32)   NOT NULL COMMENT 'Actual/Exercise/System/Test/Draft',
+            `message_type` VARCHAR(32)   NULL     COMMENT 'Alert/Update/Cancel',
+            `onset`        DATETIME      NULL,
+            `expires`      DATETIME      NULL,
+            `headline`     TEXT          NULL,
+            `description`  MEDIUMTEXT    NULL,
+            `area_desc`    TEXT          NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_nws_alerts_fetched`  (`fetched_at`),
+            KEY `idx_nws_alerts_event`    (`event`),
+            KEY `idx_nws_alerts_severity` (`severity`),
+            KEY `idx_nws_alerts_expires`  (`expires`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+
+    # ------------------------------------------------------------------
+    # nws_hourly_forecast — structured store for NWS hourly forecast periods.
+    # Up to 12 periods per ingest run; enables the forecast endpoint.
+    # ------------------------------------------------------------------
+    "nws_hourly_forecast": """
+        CREATE TABLE IF NOT EXISTS `nws_hourly_forecast` (
+            `id`                  BIGINT        NOT NULL AUTO_INCREMENT,
+            `fetched_at`          DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `location_lat`        DECIMAL(8,4)  NOT NULL,
+            `location_lon`        DECIMAL(8,4)  NOT NULL,
+            `period_number`       SMALLINT      NOT NULL,
+            `start_time`          DATETIME      NOT NULL,
+            `end_time`            DATETIME      NOT NULL,
+            `is_daytime`          TINYINT(1)    NOT NULL DEFAULT 1,
+            `temperature_f`       SMALLINT      NULL,
+            `temperature_trend`   VARCHAR(16)   NULL     COMMENT 'rising/falling/null',
+            `wind_speed`          VARCHAR(32)   NULL     COMMENT 'e.g. 5 mph or 5 to 10 mph',
+            `wind_direction`      VARCHAR(8)    NULL,
+            `short_forecast`      VARCHAR(255)  NULL,
+            `detailed_forecast`   TEXT          NULL,
+            `precip_probability`  TINYINT       NULL     COMMENT 'Percentage 0-100',
+            PRIMARY KEY (`id`),
+            KEY `idx_nws_hf_fetched`    (`fetched_at`),
+            KEY `idx_nws_hf_start_time` (`start_time`),
+            KEY `idx_nws_hf_location`   (`location_lat`, `location_lon`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+
+    # ------------------------------------------------------------------
+    # opensky_states — structured snapshot of aircraft state vectors.
+    # ------------------------------------------------------------------
+    "opensky_states": """
+        CREATE TABLE IF NOT EXISTS `opensky_states` (
+            `id`             BIGINT        NOT NULL AUTO_INCREMENT,
+            `fetched_at`     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `icao24`         VARCHAR(16)   NOT NULL,
+            `callsign`       VARCHAR(32)   NULL,
+            `origin_country` VARCHAR(128)  NULL,
+            `longitude`      DECIMAL(9,6)  NULL,
+            `latitude`       DECIMAL(9,6)  NULL,
+            `baro_altitude`  FLOAT         NULL,
+            `on_ground`      TINYINT(1)    NOT NULL DEFAULT 0,
+            `velocity_ms`    FLOAT         NULL,
+            `true_track`     FLOAT         NULL,
+            `vertical_rate`  FLOAT         NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_os_fetched` (`fetched_at`),
+            KEY `idx_os_icao24` (`icao24`),
+            KEY `idx_os_lat_lon` (`latitude`, `longitude`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+
+    # ------------------------------------------------------------------
+    # purpleair_observations — structured PurpleAir sensor observations.
+    # ------------------------------------------------------------------
+    "purpleair_observations": """
+        CREATE TABLE IF NOT EXISTS `purpleair_observations` (
+            `id`             BIGINT        NOT NULL AUTO_INCREMENT,
+            `fetched_at`     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `sensor_name`    VARCHAR(255)  NULL,
+            `latitude`       DECIMAL(9,6)  NULL,
+            `longitude`      DECIMAL(9,6)  NULL,
+            `pm25_ugm3`      FLOAT         NULL,
+            `humidity_pct`   FLOAT         NULL,
+            `temperature_f`  FLOAT         NULL,
+            `confidence_pct` FLOAT         NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_pa_fetched` (`fetched_at`),
+            KEY `idx_pa_lat_lon` (`latitude`, `longitude`),
+            KEY `idx_pa_pm25` (`pm25_ugm3`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
+
+    # ------------------------------------------------------------------
+    # road_incidents — normalized incidents from 511 / DOT feeds.
+    # ------------------------------------------------------------------
+    "road_incidents": """
+        CREATE TABLE IF NOT EXISTS `road_incidents` (
+            `id`            BIGINT        NOT NULL AUTO_INCREMENT,
+            `fetched_at`    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `source`        VARCHAR(64)   NOT NULL DEFAULT '511',
+            `incident_id`   VARCHAR(128)  NULL,
+            `incident_type` VARCHAR(64)   NULL,
+            `severity`      VARCHAR(32)   NULL,
+            `status`        VARCHAR(32)   NULL,
+            `description`   TEXT          NULL,
+            `start_time`    DATETIME      NULL,
+            `end_time`      DATETIME      NULL,
+            `lanes_blocked` INT           NULL,
+            `latitude`      DECIMAL(9,6)  NULL,
+            `longitude`     DECIMAL(9,6)  NULL,
+            PRIMARY KEY (`id`),
+            KEY `idx_ri_fetched` (`fetched_at`),
+            KEY `idx_ri_type` (`incident_type`),
+            KEY `idx_ri_severity` (`severity`),
+            KEY `idx_ri_start` (`start_time`),
+            KEY `idx_ri_lat_lon` (`latitude`, `longitude`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """,
 }
 
 # Tables must be created in this order to satisfy foreign key dependencies
@@ -227,6 +357,11 @@ CREATE_ORDER = [
     "audit_log",
     "invite_tokens",
     "password_reset_tokens",
+    "nws_alerts",
+    "nws_hourly_forecast",
+    "opensky_states",
+    "purpleair_observations",
+    "road_incidents",
 ]
 
 

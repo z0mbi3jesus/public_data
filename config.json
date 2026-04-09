@@ -32,7 +32,9 @@
       "enabled": true,
       "api_url": "http://api.weatherapi.com/v1/current.json",
       "city": "Portland,US",
-      "key": "YOUR_WEATHERAPI_KEY"
+      "key": "YOUR_WEATHERAPI_KEY",
+      "lat": 45.5231,
+      "lon": -122.6765
     },
     "traffic": {
       "enabled": true,
@@ -44,13 +46,24 @@
         {"label": "North Portland", "coords": "45.58,-122.69"},
         {"label": "Southeast Portland", "coords": "45.50,-122.64"},
         {"label": "West Hills", "coords": "45.52,-122.74"}
-      ]
+      ],
+      "incidents": {
+        "enabled": false,
+        "api_url": "https://example-511-feed/api/incidents",
+        "key": "OPTIONAL_511_API_KEY",
+        "key_header": "x-api-key",
+        "params": {
+          "format": "geojson"
+        },
+        "timeout_sec": 20
+      }
     },
     "airport": {
       "enabled": true,
       "api_url": "https://api.aviationstack.com/v1/flights",
       "key": "YOUR_AVIATIONSTACK_KEY",
       "reference_csv": "data/airports.csv",
+      "min_interval_minutes": 240,
       "key_param": "access_key",
       "airport_param": "dep_iata",
       "airports": ["PDX"],
@@ -58,6 +71,29 @@
         "limit": 50
       },
       "timeout_sec": 20
+    },
+    "opensky": {
+      "enabled": false,
+      "api_url": "https://opensky-network.org/api",
+      "client_id": "",
+      "client_secret": "",
+      "lamin": 45.2,
+      "lomin": -123.2,
+      "lamax": 46.0,
+      "lomax": -122.2,
+      "timeout_sec": 15
+    },
+    "purpleair": {
+      "enabled": false,
+      "api_url": "https://api.purpleair.com/v1/sensors",
+      "key": "YOUR_PURPLEAIR_KEY",
+      "bbox": {
+        "nwlat": 45.8,
+        "nwlng": -123.1,
+        "selat": 45.3,
+        "selng": -122.3
+      },
+      "timeout_sec": 15
     }
   }
 }

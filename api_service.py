@@ -767,6 +767,13 @@ class AdminKeyRevokePayload(BaseModel):
     key_prefix: str
 
 
+class SignupPayload(BaseModel):
+    email: str
+    password: str
+    confirm_password: str
+    business_name: str
+
+
 class InviteCreatePayload(BaseModel):
     email: str
     tenant_id: int
@@ -927,6 +934,61 @@ def login_client(payload: LoginPayload):
     finally:
         cur.close()
         conn.close()
+
+
+def signup_client(payload: SignupPayload):
+    email = str(payload.email).lower().strip()
+    business_name = payload.business_name.strip()
+    password = payload.password
+
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    if not business_name:
+        raise HTTPException(status_code=400, detail="Business name is required")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if password != payload.confirm_password:
+        raise HTTPException(status_code=400, detail="Passwords do not match")
+
+    tenant_payload = ProviderTenantCreate(
+        name=business_name,
+        contact_email=email,
+        plan_tier="trial",
+        entitlements=["restaurant"],
+        api_key_label="default",
+    )
+    tenant_result = create_tenant(tenant_payload)
+    tenant_id = tenant_result["tenant_id"]
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO users (tenant_id, email, password_hash, role, active) VALUES (%s, %s, %s, %s, 1)",
+            (tenant_id, email, hash_password(password), "admin"),
+        )
+        conn.commit()
+        write_audit_log(
+            "client_signup", "public",
+            tenant_id=tenant_id,
+            details={"email": email, "business_name": business_name, "plan_tier": "trial"},
+        )
+    except mysql.connector.Error as err:
+        conn.rollback()
+        if getattr(err, "errno", None) == 1062:
+            raise HTTPException(status_code=409, detail="An account with that email already exists")
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+    return {
+        "tenant_id": tenant_id,
+        "tenant_name": business_name,
+        "email": email,
+        "plan_tier": "trial",
+        "api_key": tenant_result["api_key"],
+    }
 
 
 def revoke_session(raw_token, table_name):
@@ -1638,6 +1700,109 @@ def fetch_restaurant_operations_insight(context):
     }
 
 
+def fetch_incident_ticker_items(limit=20):
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    items = []
+    seen = set()
+
+    def _push_item(kind, headline, location=None, happened_at=None):
+        text = str(headline or "").strip()
+        if not text:
+            return
+        key = (kind, text.lower(), str(location or "").lower())
+        if key in seen:
+            return
+        seen.add(key)
+        items.append(
+            {
+                "kind": kind,
+                "headline": text,
+                "location": str(location or "").strip() or None,
+                "happened_at": serialize_dt(happened_at),
+            }
+        )
+
+    try:
+        # Preferred structured incident rows, if present.
+        try:
+            cur.execute(
+                """
+                SELECT incident_type, description, start_time, fetched_at, latitude, longitude
+                FROM road_incidents
+                ORDER BY COALESCE(start_time, fetched_at) DESC
+                LIMIT %s
+                """,
+                (max(limit, 10),),
+            )
+            for row in cur.fetchall():
+                location = None
+                lat = row.get("latitude")
+                lon = row.get("longitude")
+                if lat is not None and lon is not None:
+                    location = f"{lat},{lon}"
+                headline = row.get("description") or row.get("incident_type")
+                _push_item("traffic", headline, location, row.get("start_time") or row.get("fetched_at"))
+        except Exception:
+            pass
+
+        try:
+            cur.execute(
+                """
+                SELECT event, headline, area_desc, onset, fetched_at
+                FROM nws_alerts
+                WHERE expires IS NULL OR expires >= NOW() - INTERVAL 12 HOUR
+                ORDER BY COALESCE(onset, fetched_at) DESC
+                LIMIT %s
+                """,
+                (max(limit, 10),),
+            )
+            for row in cur.fetchall():
+                headline = row.get("headline") or row.get("event")
+                _push_item("weather", headline, row.get("area_desc"), row.get("onset") or row.get("fetched_at"))
+        except Exception:
+            pass
+
+        # Fallback: infer incident-like entries from raw stream events.
+        if len(items) < limit:
+            cur.execute(
+                """
+                SELECT event_ts, location_label, payload
+                FROM raw_events
+                WHERE stream_name IN ('traffic', 'weather')
+                  AND event_ts >= NOW() - INTERVAL 24 HOUR
+                ORDER BY id DESC
+                LIMIT 800
+                """
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row.get("payload") or "{}")
+                except Exception:
+                    continue
+
+                metric = str(payload.get("metric") or "").strip().lower()
+                value = payload.get("value")
+                location = payload.get("location") or row.get("location_label")
+                ts = row.get("event_ts")
+
+                if metric in {"incident_description", "incident_type"}:
+                    _push_item("traffic", value, location, ts)
+                elif metric in {"nws_alert_headline", "nws_alert_event"}:
+                    _push_item("weather", value, location, ts)
+
+                if len(items) >= limit * 2:
+                    break
+
+        # Most recent first, then trim.
+        items.sort(key=lambda x: x.get("happened_at") or "", reverse=True)
+        return {"items": items[:limit], "as_of": serialize_dt(datetime.utcnow())}
+    finally:
+        cur.close()
+        conn.close()
+
+
 def build_dashboard_summary(context):
     entitlements = fetch_entitlements(context["tenant_id"])
     signals = {}
@@ -1668,28 +1833,38 @@ def render_accept_invite_html(token: str = ""):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Accept Invite – Public Data</title>
+<title>Activate Account - StreetWise</title>
 <style>
-body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-     font-family:system-ui,sans-serif;background:#f5efe4;color:#1e2a25}}
-.card{{background:#fff;border-radius:18px;padding:40px 36px;width:340px;
-       box-shadow:0 12px 40px rgba(0,0,0,.12)}}
-h2{{margin:0 0 6px;font-size:1.3rem}}
-p{{margin:0 0 20px;font-size:.85rem;color:#5f6b64}}
-label{{display:block;font-size:.82rem;font-weight:600;margin-bottom:4px;color:#1e2a25}}
-input{{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;
-       border-radius:9px;font-size:.95rem;margin-bottom:16px}}
-button{{width:100%;padding:11px;background:#0f766e;color:#fff;border:none;
-        border-radius:9px;font-size:1rem;cursor:pointer;font-weight:600}}
-button:hover{{background:#0d6057}}
-#msg{{margin-top:14px;font-size:.85rem;text-align:center;color:#b7412b}}
-#ok{{margin-top:14px;font-size:.85rem;text-align:center;color:#1f7a3d;display:none}}
+:root{{--bg:#070812;--panel:rgba(14,16,28,.86);--line:rgba(113,130,255,.18);--ink:#f4f7ff;--muted:#aab4d4;--red:#ff4d6d;--blue:#4da3ff;--purple:#9b5cff;--good:#3ddc97;}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:18px;
+     font-family:"Segoe UI",Tahoma,sans-serif;color:var(--ink);background:
+     radial-gradient(900px 420px at 10% 10%, rgba(255,77,109,.18), transparent 55%),
+     radial-gradient(800px 400px at 90% 15%, rgba(77,163,255,.18), transparent 55%),
+     radial-gradient(700px 360px at 50% 100%, rgba(155,92,255,.16), transparent 52%),
+     linear-gradient(160deg,#070812,#0d1020 45%,#141735)}}
+.card{{position:relative;background:var(--panel);border-radius:24px;padding:42px 34px;width:min(380px,100%);
+    border:1px solid var(--line);box-shadow:0 0 0 1px rgba(255,255,255,.03),0 20px 60px rgba(0,0,0,.45),0 0 36px rgba(77,163,255,.15)}}
+.card::before{{content:"";position:absolute;inset:-1px;border-radius:24px;padding:1px;background:linear-gradient(135deg,rgba(255,77,109,.5),rgba(77,163,255,.45),rgba(155,92,255,.4));-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}}
+.brand{{margin:0 0 10px;font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--blue)}}
+h2{{margin:0 0 8px;font-size:1.55rem}}
+p{{margin:0 0 22px;font-size:.9rem;line-height:1.5;color:var(--muted)}}
+label{{display:block;font-size:.78rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px;color:#d7dfff}}
+input{{width:100%;box-sizing:border-box;padding:12px 13px;border:1px solid rgba(119,132,214,.26);background:rgba(10,12,24,.82);color:var(--ink);
+    border-radius:12px;font-size:.96rem;margin-bottom:16px}}
+button{{width:100%;padding:12px;background:linear-gradient(135deg,var(--red),var(--purple),var(--blue));color:#fff;border:none;
+     border-radius:12px;font-size:1rem;cursor:pointer;font-weight:700;box-shadow:0 10px 30px rgba(155,92,255,.25)}}
+button:hover{{filter:brightness(1.05)}}
+a{{color:var(--blue)}}
+#msg{{margin-top:14px;font-size:.85rem;text-align:center;color:#ff8ca1}}
+#ok{{margin-top:14px;font-size:.85rem;text-align:center;color:var(--good);display:none}}
 </style>
 </head>
 <body>
 <div class="card">
+  <p class="brand">StreetWise</p>
   <h2>Set your password</h2>
-  <p>You've been invited to access the Public Data platform. Choose a password to activate your account.</p>
+  <p>You've been invited into StreetWise. Set your password to activate access to your live operating dashboard.</p>
   <label>Password</label>
   <input type="password" id="pw" placeholder="At least 8 characters">
   <label>Confirm password</label>
@@ -1732,26 +1907,36 @@ def render_reset_password_html(token: str = ""):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Reset Password – Public Data</title>
+<title>Reset Password - StreetWise</title>
 <style>
-body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-     font-family:system-ui,sans-serif;background:#f5efe4;color:#1e2a25}}
-.card{{background:#fff;border-radius:18px;padding:40px 36px;width:340px;
-       box-shadow:0 12px 40px rgba(0,0,0,.12)}}
-h2{{margin:0 0 6px;font-size:1.3rem}}
-p{{margin:0 0 20px;font-size:.85rem;color:#5f6b64}}
-label{{display:block;font-size:.82rem;font-weight:600;margin-bottom:4px;color:#1e2a25}}
-input{{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;
-       border-radius:9px;font-size:.95rem;margin-bottom:16px}}
-button{{width:100%;padding:11px;background:#0f766e;color:#fff;border:none;
-        border-radius:9px;font-size:1rem;cursor:pointer;font-weight:600}}
-button:hover{{background:#0d6057}}
-#msg{{margin-top:14px;font-size:.85rem;text-align:center;color:#b7412b}}
-#ok{{margin-top:14px;font-size:.85rem;text-align:center;color:#1f7a3d;display:none}}
+:root{{--bg:#070812;--panel:rgba(14,16,28,.86);--line:rgba(113,130,255,.18);--ink:#f4f7ff;--muted:#aab4d4;--red:#ff4d6d;--blue:#4da3ff;--purple:#9b5cff;--good:#3ddc97;}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:18px;
+     font-family:"Segoe UI",Tahoma,sans-serif;color:var(--ink);background:
+     radial-gradient(900px 420px at 12% 8%, rgba(255,77,109,.18), transparent 55%),
+     radial-gradient(860px 420px at 92% 14%, rgba(77,163,255,.18), transparent 55%),
+     radial-gradient(760px 360px at 48% 100%, rgba(155,92,255,.16), transparent 52%),
+     linear-gradient(160deg,#070812,#0d1020 45%,#141735)}}
+.card{{position:relative;background:var(--panel);border-radius:24px;padding:42px 34px;width:min(380px,100%);
+    border:1px solid var(--line);box-shadow:0 0 0 1px rgba(255,255,255,.03),0 20px 60px rgba(0,0,0,.45),0 0 36px rgba(77,163,255,.15)}}
+.card::before{{content:"";position:absolute;inset:-1px;border-radius:24px;padding:1px;background:linear-gradient(135deg,rgba(255,77,109,.5),rgba(77,163,255,.45),rgba(155,92,255,.4));-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}}
+.brand{{margin:0 0 10px;font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--blue)}}
+h2{{margin:0 0 8px;font-size:1.55rem}}
+p{{margin:0 0 22px;font-size:.9rem;line-height:1.5;color:var(--muted)}}
+label{{display:block;font-size:.78rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px;color:#d7dfff}}
+input{{width:100%;box-sizing:border-box;padding:12px 13px;border:1px solid rgba(119,132,214,.26);background:rgba(10,12,24,.82);color:var(--ink);
+    border-radius:12px;font-size:.96rem;margin-bottom:16px}}
+button{{width:100%;padding:12px;background:linear-gradient(135deg,var(--red),var(--purple),var(--blue));color:#fff;border:none;
+     border-radius:12px;font-size:1rem;cursor:pointer;font-weight:700;box-shadow:0 10px 30px rgba(155,92,255,.25)}}
+button:hover{{filter:brightness(1.05)}}
+a{{color:var(--blue)}}
+#msg{{margin-top:14px;font-size:.85rem;text-align:center;color:#ff8ca1}}
+#ok{{margin-top:14px;font-size:.85rem;text-align:center;color:var(--good);display:none}}
 </style>
 </head>
 <body>
 <div class="card">
+  <p class="brand">StreetWise</p>
   <h2>Reset your password</h2>
   <p>Enter a new password for your account. All active sessions will be signed out.</p>
   <label>New password</label>
@@ -1795,27 +1980,32 @@ def render_audit_log_html():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Audit Log – Public Data Admin</title>
+<title>Audit Log - StreetWise Admin</title>
 <style>
-body{margin:0;font-family:system-ui,sans-serif;background:#f5efe4;color:#1e2a25}
+:root{--bg:#070812;--panel:rgba(14,16,28,.88);--ink:#f4f7ff;--muted:#aab4d4;--line:rgba(113,130,255,.18);--red:#ff4d6d;--blue:#4da3ff;--purple:#9b5cff;--good:#3ddc97;--amber:#ffb347}
+body{margin:0;font-family:"Segoe UI",Tahoma,sans-serif;background:
+        radial-gradient(900px 420px at 0% 0%, rgba(255,77,109,.15), transparent 55%),
+        radial-gradient(900px 420px at 100% 0%, rgba(77,163,255,.16), transparent 55%),
+        linear-gradient(160deg,#070812,#0d1020 45%,#141735);color:var(--ink)}
 .shell{max-width:1100px;margin:28px auto;padding:0 16px}
-h2{margin:0 0 18px;font-size:1.3rem}
-a{color:#0f766e;text-decoration:none;font-size:.85rem}
-table{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;
-      overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08);font-size:.82rem}
-thead{background:#0f766e;color:#fff}
-th,td{padding:9px 12px;text-align:left;border-bottom:1px solid #f0ece4}
+h2{margin:0 0 18px;font-size:1.4rem}
+a{color:var(--blue);text-decoration:none;font-size:.85rem}
+table{width:100%;border-collapse:collapse;background:var(--panel);border-radius:18px;border:1px solid var(--line);
+            overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.35);font-size:.82rem}
+thead{background:linear-gradient(90deg,rgba(255,77,109,.28),rgba(77,163,255,.28));color:#fff}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid rgba(113,130,255,.12)}
 tr:last-child td{border-bottom:none}
 .badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:.72rem;font-weight:700}
-.admin{background:#e8f5f3;color:#0f766e}
-.client{background:#fef8ec;color:#b8691c}
-.system{background:#eef;color:#444}
+.admin{background:rgba(77,163,255,.14);color:var(--blue)}
+.client{background:rgba(255,77,109,.14);color:#ff8ca1}
+.system{background:rgba(155,92,255,.14);color:#d9b7ff}
+code{color:#ffd9e2}
 </style>
 </head>
 <body>
 <div class="shell">
   <p><a href="/admin">&larr; Back to Admin</a></p>
-  <h2>Audit Log</h2>
+    <h2>StreetWise Audit Log</h2>
   <table id="tbl">
     <thead><tr>
       <th>Time (UTC)</th><th>Action</th><th>Actor type</th>
@@ -1854,21 +2044,22 @@ def render_dashboard_html():
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Public Data Atlas</title>
+    <title>StreetWise</title>
     <style>
         :root {
-            --sand-1: #f5efe4;
-            --sand-2: #efe5d3;
-            --panel: rgba(255, 250, 241, 0.88);
-            --panel-strong: #fff8ee;
-            --ink: #1e2a25;
-            --muted: #5f6b64;
-            --line: rgba(34, 43, 35, 0.12);
-            --teal: #0f766e;
-            --amber: #b8691c;
-            --red: #b7412b;
-            --green: #1f7a3d;
-            --shadow: 0 18px 50px rgba(25, 38, 32, 0.16);
+            --bg-1: #070812;
+            --bg-2: #101327;
+            --panel: rgba(12, 14, 26, 0.84);
+            --panel-strong: rgba(18, 22, 38, 0.94);
+            --ink: #f4f7ff;
+            --muted: #aab4d4;
+            --line: rgba(113, 130, 255, 0.16);
+            --teal: #4da3ff;
+            --amber: #ffb347;
+            --red: #ff4d6d;
+            --green: #3ddc97;
+            --purple: #9b5cff;
+            --shadow: 0 18px 50px rgba(0, 0, 0, 0.38);
             --radius-xl: 32px;
             --radius-lg: 22px;
             --radius-md: 14px;
@@ -1881,13 +2072,70 @@ def render_dashboard_html():
         body {
             margin: 0;
             min-height: 100vh;
+            padding-top: 46px;
             color: var(--ink);
             font-family: "Palatino Linotype", "Book Antiqua", Palatino, serif;
             background:
-                radial-gradient(1200px 500px at -8% -12%, rgba(15, 118, 110, 0.28), transparent 62%),
-                radial-gradient(900px 420px at 106% 8%, rgba(184, 105, 28, 0.22), transparent 60%),
-                linear-gradient(130deg, var(--sand-1), var(--sand-2));
+                radial-gradient(1200px 500px at -8% -12%, rgba(255, 77, 109, 0.22), transparent 62%),
+                radial-gradient(900px 420px at 106% 8%, rgba(77, 163, 255, 0.18), transparent 60%),
+                radial-gradient(800px 400px at 50% 100%, rgba(155, 92, 255, 0.16), transparent 58%),
+                linear-gradient(130deg, var(--bg-1), var(--bg-2));
             overflow-x: hidden;
+        }
+
+        .ticker-banner {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 50;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border-bottom: 1px solid rgba(255, 77, 109, 0.34);
+            background: linear-gradient(90deg, rgba(255,77,109,.18), rgba(77,163,255,.14), rgba(155,92,255,.14));
+            backdrop-filter: blur(8px);
+            overflow: hidden;
+        }
+
+        .ticker-label {
+            flex: 0 0 auto;
+            margin-left: 10px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,.25);
+            font-size: 11px;
+            letter-spacing: .12em;
+            text-transform: uppercase;
+            color: #ffd6df;
+            background: rgba(16, 20, 38, 0.58);
+        }
+
+        .ticker-viewport {
+            position: relative;
+            min-width: 0;
+            flex: 1;
+            overflow: hidden;
+            height: 20px;
+        }
+
+        .ticker-run {
+            position: absolute;
+            white-space: nowrap;
+            font-size: 13px;
+            color: #f4f7ff;
+            will-change: transform;
+            animation: ticker-scroll 32s linear infinite;
+        }
+
+        .ticker-run:hover {
+            animation-play-state: paused;
+        }
+
+        @keyframes ticker-scroll {
+            0% { transform: translateX(100%); }
+            100% { transform: translateX(-100%); }
         }
 
         .bg-ribbon {
@@ -1897,6 +2145,7 @@ def render_dashboard_html():
             height: 56vh;
             border-radius: 50%;
             background: radial-gradient(circle, rgba(15, 118, 110, 0.14), rgba(15, 118, 110, 0));
+            background: radial-gradient(circle, rgba(155, 92, 255, 0.18), rgba(155, 92, 255, 0));
             pointer-events: none;
             animation: drift 14s ease-in-out infinite alternate;
             z-index: 0;
@@ -1939,7 +2188,7 @@ def render_dashboard_html():
             width: 340px;
             height: 340px;
             border-radius: 50%;
-            background: radial-gradient(circle, rgba(184, 105, 28, 0.24), transparent 62%);
+            background: radial-gradient(circle, rgba(255, 77, 109, 0.24), transparent 62%);
             pointer-events: none;
         }
 
@@ -1978,7 +2227,7 @@ def render_dashboard_html():
         .tenant-chip {
             border-radius: 999px;
             padding: 11px 14px;
-            background: rgba(15, 118, 110, 0.12);
+            background: rgba(77, 163, 255, 0.12);
             color: var(--teal);
             font-size: 13px;
             letter-spacing: 0.06em;
@@ -2081,7 +2330,7 @@ def render_dashboard_html():
         }
 
         .btn-primary {
-            background: linear-gradient(130deg, #0f766e, #155e58);
+            background: linear-gradient(130deg, var(--red), var(--purple), var(--teal));
             color: #fff;
         }
 
@@ -2113,7 +2362,7 @@ def render_dashboard_html():
         }
 
         .toggle.on {
-            background: rgba(15, 118, 110, 0.16);
+            background: rgba(155, 92, 255, 0.18);
             color: var(--teal);
         }
 
@@ -2142,7 +2391,7 @@ def render_dashboard_html():
         }
 
         .range-btn.active {
-            background: rgba(15, 118, 110, 0.13);
+            background: rgba(77, 163, 255, 0.16);
             color: var(--teal);
         }
 
@@ -2200,10 +2449,10 @@ def render_dashboard_html():
             white-space: nowrap;
         }
 
-        .badge.low { background: rgba(15, 118, 110, 0.11); color: var(--teal); }
+        .badge.low { background: rgba(77, 163, 255, 0.11); color: var(--teal); }
         .badge.safe, .badge.ok { background: rgba(31, 122, 61, 0.12); color: var(--green); }
         .badge.moderate, .badge.degraded { background: rgba(184, 105, 28, 0.14); color: var(--amber); }
-        .badge.high, .badge.poor, .badge.down { background: rgba(183, 65, 43, 0.14); color: var(--red); }
+        .badge.high, .badge.poor, .badge.down { background: rgba(255, 77, 109, 0.14); color: var(--red); }
 
         .sparkline {
             border: 1px solid var(--line);
@@ -2327,13 +2576,19 @@ def render_dashboard_html():
 </head>
 <body>
     <div class="bg-ribbon"></div>
+    <div class="ticker-banner" aria-live="polite">
+        <span class="ticker-label">Incident Feed</span>
+        <div class="ticker-viewport">
+            <div id="incident-ticker" class="ticker-run"></div>
+        </div>
+    </div>
     <main class="shell">
         <section class="hero glass">
             <div class="hero-top">
                 <div>
                     <p class="kicker">Live Urban Intelligence</p>
-                    <h1>Public Data Atlas</h1>
-                    <p class="subtitle">Demand pressure, route risk, and outdoor safety in one operational cockpit. Authenticate with a tenant key to inspect live scores, trend lines, and stream health.</p>
+                    <h1>StreetWise</h1>
+                    <p class="subtitle">Street-level demand, risk, and operating signals for mobile food businesses. Authenticate with your tenant key to inspect live scores, trend lines, and stream health.</p>
                 </div>
                 <div class="tenant-chip" id="tenant-chip">No tenant connected</div>
             </div>
@@ -2356,7 +2611,7 @@ def render_dashboard_html():
         <section class="panel glass">
             <div class="panel-head">
                 <h2 class="panel-title">Access and Controls</h2>
-                <p class="meta" id="tenant-meta">Use the seeded demo API key or your own tenant key.</p>
+                <p class="meta" id="tenant-meta">Use your StreetWise tenant key to open the live signal deck.</p>
             </div>
             <div class="controls">
                 <div>
@@ -2412,6 +2667,7 @@ def render_dashboard_html():
         const signalGrid = document.getElementById('signal-grid');
         const healthGrid = document.getElementById('health-grid');
         const errorBox = document.getElementById('error-box');
+        const incidentTickerEl = document.getElementById('incident-ticker');
 
         const signalLabels = {
             restaurant: 'Restaurant Demand',
@@ -2419,9 +2675,9 @@ def render_dashboard_html():
             outdoor: 'Outdoor Safety'
         };
 
-        const storedKey = localStorage.getItem('public-data-api-key');
-        const storedAutoRefresh = localStorage.getItem('public-data-auto-refresh') === 'on';
-        const storedRange = Number(localStorage.getItem('public-data-range-hours') || '24');
+        const storedKey = localStorage.getItem('streetwise-api-key');
+        const storedAutoRefresh = localStorage.getItem('streetwise-auto-refresh') === 'on';
+        const storedRange = Number(localStorage.getItem('streetwise-range-hours') || '24');
 
         const REFRESH_INTERVAL_MS = 45000;
         let refreshTimer = null;
@@ -2467,6 +2723,48 @@ def render_dashboard_html():
                 return String(value);
             }
             return n.toFixed(1);
+        }
+
+        function fmtIncident(item) {
+            const kind = String(item.kind || 'event').toUpperCase();
+            const headline = String(item.headline || '').trim();
+            const where = item.location ? ` @ ${item.location}` : '';
+            const when = item.happened_at ? ` (${formatDate(item.happened_at)})` : '';
+            return `[${kind}] ${headline}${where}${when}`;
+        }
+
+        async function loadIncidentTicker() {
+            const apiKey = apiInput.value.trim();
+            if (!apiKey) {
+                incidentTickerEl.textContent = 'Connect with an API key to load the incident feed.';
+                return;
+            }
+
+            try {
+                const resp = await fetch('/v1/dashboard/incidents-ticker?limit=18', {
+                    headers: {
+                        'X-API-Key': apiKey
+                    }
+                });
+                const payload = await resp.json();
+                if (!resp.ok) {
+                    incidentTickerEl.textContent = '';
+                    return;
+                }
+
+                const items = Array.isArray(payload.items) ? payload.items : [];
+                if (!items.length) {
+                    const emptyText = 'No active traffic or weather incidents in the last 24 hours.';
+                    incidentTickerEl.textContent = `${emptyText}  •  ${emptyText}`;
+                    return;
+                }
+
+                const text = items.map(fmtIncident).join('  •  ');
+                incidentTickerEl.textContent = `${text}  •  ${text}`;
+            } catch (err) {
+                const unavailableText = 'Incident feed temporarily unavailable. Retrying shortly.';
+                incidentTickerEl.textContent = `${unavailableText}  •  ${unavailableText}`;
+            }
         }
 
         function getFilteredTrend(points, hours) {
@@ -2582,7 +2880,7 @@ def render_dashboard_html():
 
         function setRange(hours) {
             selectedRangeHours = hours;
-            localStorage.setItem('public-data-range-hours', String(hours));
+            localStorage.setItem('streetwise-range-hours', String(hours));
             rangeGroup.querySelectorAll('.range-btn').forEach((btn) => {
                 const btnHours = Number(btn.dataset.hours);
                 btn.classList.toggle('active', btnHours === selectedRangeHours);
@@ -2603,11 +2901,11 @@ def render_dashboard_html():
                 }, REFRESH_INTERVAL_MS);
                 autoToggle.classList.add('on');
                 autoToggle.textContent = `Auto refresh: on (${Math.floor(REFRESH_INTERVAL_MS / 1000)}s)`;
-                localStorage.setItem('public-data-auto-refresh', 'on');
+                localStorage.setItem('streetwise-auto-refresh', 'on');
             } else {
                 autoToggle.classList.remove('on');
                 autoToggle.textContent = 'Auto refresh: off';
-                localStorage.setItem('public-data-auto-refresh', 'off');
+                localStorage.setItem('streetwise-auto-refresh', 'off');
             }
         }
 
@@ -2635,7 +2933,7 @@ def render_dashboard_html():
                     throw new Error(payload.detail || 'Request failed');
                 }
 
-                localStorage.setItem('public-data-api-key', apiKey);
+                localStorage.setItem('streetwise-api-key', apiKey);
                 tenantChip.textContent = `${payload.tenant.tenant_name} | ${payload.tenant.plan_tier}`;
                 tenantMeta.textContent = `Entitlements: ${payload.tenant.entitlements.join(', ') || 'none'}`;
                 signalMeta.textContent = `Viewing trend range: ${selectedRangeHours === 168 ? '7 days' : `${selectedRangeHours} hours`}`;
@@ -2648,6 +2946,7 @@ def render_dashboard_html():
 
                 renderSignals(payload.signals, payload.trends || {});
                 renderHealth(payload.stream_health || []);
+                loadIncidentTicker();
             } catch (error) {
                 setError(error.message || String(error));
             } finally {
@@ -2667,7 +2966,7 @@ def render_dashboard_html():
         });
 
         clearBtn.addEventListener('click', () => {
-            localStorage.removeItem('public-data-api-key');
+            localStorage.removeItem('streetwise-api-key');
             apiInput.value = '';
             tenantChip.textContent = 'No tenant connected';
             tenantMeta.textContent = 'Use the seeded demo API key or your own tenant key.';
@@ -2678,12 +2977,13 @@ def render_dashboard_html():
             signalUpdated.textContent = 'Waiting for first load';
             signalGrid.innerHTML = '';
             healthGrid.innerHTML = '';
+            incidentTickerEl.textContent = '';
             setAutoRefresh(false);
             setError('');
         });
 
         autoToggle.addEventListener('click', () => {
-            const currentlyOn = localStorage.getItem('public-data-auto-refresh') === 'on';
+            const currentlyOn = localStorage.getItem('streetwise-auto-refresh') === 'on';
             setAutoRefresh(!currentlyOn);
         });
 
@@ -2708,6 +3008,8 @@ def render_dashboard_html():
         if (storedKey) {
             loadDashboard(false);
         }
+
+        setInterval(loadIncidentTicker, 120000);
     </script>
 </body>
 </html>
@@ -2724,19 +3026,20 @@ def render_provider_html():
     <title>Provider Console</title>
     <style>
         :root {
-            --bg-a: #f0efe9;
-            --bg-b: #e6ecf3;
-            --panel: rgba(255, 255, 255, 0.84);
-            --ink: #1c2b34;
-            --muted: #5b6e79;
-            --line: rgba(28, 43, 52, 0.12);
-            --blue: #0b5ad9;
-            --cyan: #0f766e;
-            --green: #1f7a3d;
-            --amber: #b8691c;
-            --red: #b7412b;
+            --bg-a: #070812;
+            --bg-b: #12162e;
+            --panel: rgba(14, 16, 28, 0.86);
+            --ink: #f4f7ff;
+            --muted: #aab4d4;
+            --line: rgba(113, 130, 255, 0.16);
+            --blue: #4da3ff;
+            --cyan: #7ce7ff;
+            --green: #3ddc97;
+            --amber: #ffb347;
+            --red: #ff4d6d;
+            --purple: #9b5cff;
             --radius: 16px;
-            --shadow: 0 16px 40px rgba(17, 30, 42, 0.14);
+            --shadow: 0 16px 40px rgba(0, 0, 0, 0.34);
         }
 
         * { box-sizing: border-box; }
@@ -2747,8 +3050,9 @@ def render_provider_html():
             color: var(--ink);
             font-family: "Segoe UI", Tahoma, sans-serif;
             background:
-                radial-gradient(900px 360px at -10% -20%, rgba(11, 90, 217, 0.22), transparent 65%),
-                radial-gradient(700px 320px at 110% 0%, rgba(15, 118, 110, 0.16), transparent 60%),
+                radial-gradient(900px 360px at -10% -20%, rgba(255, 77, 109, 0.22), transparent 65%),
+                radial-gradient(700px 320px at 110% 0%, rgba(77, 163, 255, 0.18), transparent 60%),
+                radial-gradient(700px 320px at 50% 110%, rgba(155, 92, 255, 0.14), transparent 60%),
                 linear-gradient(130deg, var(--bg-a), var(--bg-b));
         }
 
@@ -2834,7 +3138,7 @@ def render_provider_html():
             font-size: 13px;
         }
 
-        .btn-main { background: linear-gradient(130deg, #0b5ad9, #0b3fc0); color: #fff; }
+        .btn-main { background: linear-gradient(130deg, var(--red), var(--purple), var(--blue)); color: #fff; }
         .btn-muted { background: rgba(28, 43, 52, 0.1); color: var(--ink); }
 
         .meta { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
@@ -2964,10 +3268,10 @@ def render_provider_html():
     <main class="shell">
         <section class="panel hero">
             <div>
-                <h1>Provider Console</h1>
-                <p class="sub">Control center for the data platform: tenants, entitlements, stream health, and recent signal output.</p>
+                <h1>StreetWise Console</h1>
+                <p class="sub">Control center for StreetWise: tenants, entitlements, activations, stream health, and live signal output.</p>
             </div>
-            <div class="owner-chip" id="owner-chip">Provider Access</div>
+            <div class="owner-chip" id="owner-chip">StreetWise Access</div>
         </section>
 
         <section class="panel">
@@ -3035,8 +3339,10 @@ def render_provider_html():
                 <h2 class="section-title" style="margin-top:12px;">Create Purchase Token</h2>
                 <form id="purchase-form" class="tenant-form">
                     <div>
-                        <label for="purchase-tenant-id">Tenant ID</label>
-                        <input id="purchase-tenant-id" type="number" min="1" required />
+                        <label for="purchase-tenant-select">Tenant</label>
+                        <select id="purchase-tenant-select" required>
+                            <option value="">Select tenant...</option>
+                        </select>
                     </div>
                     <div>
                         <label for="purchase-plan">Plan Tier</label>
@@ -3076,6 +3382,7 @@ def render_provider_html():
                         <th>Entitlements</th>
                         <th>API Keys</th>
                         <th>Last API Use</th>
+                        <th>Action</th>
                     </tr>
                 </thead>
                 <tbody id="tenant-rows"></tbody>
@@ -3242,12 +3549,27 @@ def render_provider_html():
         const newKeyBox = document.getElementById('new-key-box');
         const purchaseForm = document.getElementById('purchase-form');
         const purchaseResult = document.getElementById('purchase-result');
+        const purchaseTenantSelect = document.getElementById('purchase-tenant-select');
         const purchaseTokenRows = document.getElementById('purchase-token-rows');
         const tenantStatusForm = document.getElementById('tenant-status-form');
         const tenantStatusResult = document.getElementById('tenant-status-result');
         const adminKeyRotateForm = document.getElementById('admin-key-rotate-form');
         const adminKeyRevokeForm = document.getElementById('admin-key-revoke-form');
         const adminKeyActionResult = document.getElementById('admin-key-action-result');
+
+        function buildTenantOptions(tenants) {
+            const options = ['<option value="">Select tenant...</option>'];
+            (tenants || []).forEach((tenant) => {
+                options.push(`<option value="${tenant.id}">${tenant.name} (#${tenant.id})</option>`);
+            });
+            purchaseTenantSelect.innerHTML = options.join('');
+        }
+
+        function focusPurchaseForTenant(tenantId) {
+            if (!tenantId) return;
+            purchaseTenantSelect.value = String(tenantId);
+            purchaseForm.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
 
         providerKeyInput.value = 'Authenticated via cookie session';
 
@@ -3333,8 +3655,10 @@ def render_provider_html():
                         <td>${(tenant.entitlements || []).join(', ') || 'none'}</td>
                         <td>${(tenant.api_keys || []).map((k) => `<span class="mono">${k.key_prefix}</span> (${k.label})`).join('<br>') || 'none'}</td>
                         <td>${formatDate(tenant.last_api_use)}</td>
+                        <td><button class="btn-muted" type="button" onclick="focusPurchaseForTenant(${tenant.id})">Create Token</button></td>
                     </tr>
                 `).join('');
+                buildTenantOptions(tenants.tenants || []);
 
                 purchaseTokenRows.innerHTML = (tokens.purchase_tokens || []).map((token) => `
                     <tr>
@@ -3376,6 +3700,7 @@ def render_provider_html():
             kpiRefresh.textContent = 'n/a';
             signalList.innerHTML = '';
             tenantRows.innerHTML = '';
+            purchaseTenantSelect.innerHTML = '<option value="">Select tenant...</option>';
             purchaseTokenRows.innerHTML = '';
             newKeyBox.classList.add('hidden');
             newKeyBox.innerHTML = '';
@@ -3507,7 +3832,7 @@ def render_provider_html():
 
             const entitlements = Array.from(document.querySelectorAll('#purchase-ent-checkboxes input[type="checkbox"]:checked')).map((i) => i.value);
             const payload = {
-                tenant_id: Number(document.getElementById('purchase-tenant-id').value),
+                tenant_id: Number(purchaseTenantSelect.value),
                 plan_tier: document.getElementById('purchase-plan').value,
                 expires_hours: Number(document.getElementById('purchase-expiry').value || 72),
                 entitlements: entitlements.length ? entitlements : ['restaurant']
@@ -3536,6 +3861,7 @@ def render_provider_html():
                 purchaseForm.reset();
                 document.querySelector('#purchase-ent-checkboxes input[value="restaurant"]').checked = true;
                 document.getElementById('purchase-expiry').value = '72';
+                purchaseTenantSelect.value = '';
                 loadProviderDashboard();
             } catch (err) {
                 setError(err.message || String(err));
@@ -3652,22 +3978,25 @@ def render_admin_login_html():
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Admin Login</title>
+    <title>StreetWise Admin Login</title>
     <style>
-        body { font-family: Segoe UI, sans-serif; margin: 0; background: linear-gradient(140deg, #eef2f7, #dfe7f2); min-height: 100vh; display: grid; place-items: center; }
-        .card { width: min(460px, calc(100vw - 22px)); background: #fff; border-radius: 14px; border: 1px solid #d0d8e4; padding: 20px; box-shadow: 0 14px 30px rgba(24, 44, 70, 0.14); }
+        :root { --bg:#070812; --panel:rgba(14,16,28,.88); --line:rgba(113,130,255,.18); --ink:#f4f7ff; --muted:#aab4d4; --red:#ff4d6d; --blue:#4da3ff; --purple:#9b5cff; }
+        body { font-family: Segoe UI, sans-serif; margin: 0; background: linear-gradient(160deg, #070812, #0d1020 50%, #141735); min-height: 100vh; display: grid; place-items: center; }
+        .card { width: min(460px, calc(100vw - 22px)); background: var(--panel); border-radius: 20px; border: 1px solid var(--line); padding: 24px; box-shadow: 0 14px 40px rgba(0,0,0,.36); color: var(--ink); }
+        .brand { margin: 0 0 10px; color: var(--blue); letter-spacing: .22em; text-transform: uppercase; font-size: 12px; }
         h1 { margin: 0 0 8px; font-size: 34px; }
-        p { margin: 0 0 14px; color: #566372; }
-        label { display: block; margin-bottom: 4px; font-size: 12px; text-transform: uppercase; color: #566372; }
-        input { width: 100%; padding: 10px 11px; border-radius: 9px; border: 1px solid #ccd6e2; margin-bottom: 12px; }
-        button { width: 100%; border: 0; border-radius: 9px; padding: 11px; font-weight: 700; background: #0b5ad9; color: #fff; cursor: pointer; }
-        .error { color: #b7412b; margin-top: 10px; font-size: 13px; }
+        p { margin: 0 0 14px; color: var(--muted); }
+        label { display: block; margin-bottom: 4px; font-size: 12px; text-transform: uppercase; color: var(--muted); }
+        input { width: 100%; padding: 10px 11px; border-radius: 10px; border: 1px solid rgba(113,130,255,.24); background: rgba(8,10,20,.8); color: var(--ink); margin-bottom: 12px; }
+        button { width: 100%; border: 0; border-radius: 10px; padding: 11px; font-weight: 700; background: linear-gradient(135deg, var(--red), var(--purple), var(--blue)); color: #fff; cursor: pointer; }
+        .error { color: #ff8ca1; margin-top: 10px; font-size: 13px; }
     </style>
 </head>
 <body>
     <main class="card">
+        <p class="brand">StreetWise</p>
         <h1>Admin Login</h1>
-        <p>Provider-only access.</p>
+        <p>Provider-only access to StreetWise operations.</p>
         <label for="email">Email</label>
         <input id="email" type="email" placeholder="admin@publicdata.local" />
         <label for="password">Password</label>
@@ -3700,6 +4029,84 @@ def render_admin_login_html():
         """
 
 
+def render_signup_html():
+        return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>StreetWise — Sign Up</title>
+    <style>
+        :root { --bg:#070812; --panel:rgba(14,16,28,.88); --line:rgba(113,130,255,.18); --ink:#f4f7ff; --muted:#aab4d4; --red:#ff4d6d; --blue:#4da3ff; --purple:#9b5cff; }
+        body { font-family: Segoe UI, sans-serif; margin: 0; background: linear-gradient(160deg, #070812, #0d1020 50%, #141735); min-height: 100vh; display: grid; place-items: center; }
+        .card { width: min(460px, calc(100vw - 22px)); background: var(--panel); border-radius: 20px; border: 1px solid var(--line); padding: 24px; box-shadow: 0 14px 40px rgba(0,0,0,.36); color: var(--ink); }
+        .brand { margin: 0 0 10px; color: var(--blue); letter-spacing: .22em; text-transform: uppercase; font-size: 12px; }
+        h1 { margin: 0 0 8px; font-size: 34px; }
+        p { margin: 0 0 14px; color: var(--muted); }
+        label { display: block; margin-bottom: 4px; font-size: 12px; text-transform: uppercase; color: var(--muted); }
+        input { width: 100%; padding: 10px 11px; border-radius: 10px; border: 1px solid rgba(113,130,255,.24); background: rgba(8,10,20,.8); color: var(--ink); margin-bottom: 12px; box-sizing: border-box; }
+        button { width: 100%; border: 0; border-radius: 10px; padding: 11px; font-weight: 700; background: linear-gradient(135deg, var(--red), var(--purple), var(--blue)); color: #fff; cursor: pointer; font-size: 14px; }
+        .error { color: #ff8ca1; margin-top: 10px; font-size: 13px; }
+        .signin-link { text-align: center; margin-top: 14px; font-size: 13px; color: var(--muted); }
+        .signin-link a { color: var(--blue); text-decoration: none; }
+        .success { margin-top: 12px; padding: 12px; border-radius: 10px; background: rgba(77,163,255,.08); border: 1px solid rgba(77,163,255,.24); font-size: 13px; display: none; }
+        .success .api-key { font-family: Consolas, Monaco, monospace; font-size: 12px; word-break: break-all; color: var(--blue); margin-top: 6px; }
+    </style>
+</head>
+<body>
+    <main class="card">
+        <p class="brand">StreetWise</p>
+        <h1>Create Account</h1>
+        <p>Start your free trial — no credit card required. Access the Restaurant View instantly.</p>
+        <label for="business">Business Name</label>
+        <input id="business" type="text" placeholder="Acme Restaurant Co." />
+        <label for="email">Email</label>
+        <input id="email" type="email" placeholder="you@company.com" />
+        <label for="password">Password</label>
+        <input id="password" type="password" placeholder="Min. 8 characters" />
+        <label for="confirm">Confirm Password</label>
+        <input id="confirm" type="password" placeholder="Repeat password" />
+        <button id="signup">Create Account</button>
+        <div class="error" id="error"></div>
+        <div class="success" id="success">
+            <strong>Account created!</strong> Your API key:<br>
+            <div class="api-key" id="api-key-display"></div>
+            <div style="margin-top:10px;">Save this key — you won't see it again. <a href="/client/login" style="color:var(--blue);">Sign in &rarr;</a></div>
+        </div>
+        <div class="signin-link">Already have an account? <a href="/client/login">Sign in</a></div>
+    </main>
+    <script>
+        const errorEl = document.getElementById('error');
+        const successEl = document.getElementById('success');
+        document.getElementById('signup').addEventListener('click', async () => {
+            errorEl.textContent = '';
+            successEl.style.display = 'none';
+            const business_name = document.getElementById('business').value.trim();
+            const email = document.getElementById('email').value.trim();
+            const password = document.getElementById('password').value;
+            const confirm_password = document.getElementById('confirm').value;
+            try {
+                const resp = await fetch('/v1/auth/signup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password, confirm_password, business_name })
+                });
+                const payload = await resp.json();
+                if (!resp.ok) throw new Error(payload.detail || 'Signup failed');
+                document.getElementById('api-key-display').textContent = payload.api_key;
+                successEl.style.display = 'block';
+                document.getElementById('signup').disabled = true;
+            } catch (e) {
+                errorEl.textContent = e.message || String(e);
+            }
+        });
+    </script>
+</body>
+</html>
+        """
+
+
 def render_client_login_html():
         return """
 <!DOCTYPE html>
@@ -3707,28 +4114,34 @@ def render_client_login_html():
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Client Login</title>
+    <title>StreetWise Client Login</title>
     <style>
-        body { font-family: Segoe UI, sans-serif; margin: 0; background: linear-gradient(140deg, #f2eee7, #e8edf6); min-height: 100vh; display: grid; place-items: center; }
-        .card { width: min(460px, calc(100vw - 22px)); background: #fff; border-radius: 14px; border: 1px solid #d8d4cd; padding: 20px; box-shadow: 0 14px 30px rgba(38, 46, 52, 0.14); }
+        :root { --bg:#070812; --panel:rgba(14,16,28,.88); --line:rgba(113,130,255,.18); --ink:#f4f7ff; --muted:#aab4d4; --red:#ff4d6d; --blue:#4da3ff; --purple:#9b5cff; }
+        body { font-family: Segoe UI, sans-serif; margin: 0; background: linear-gradient(160deg, #070812, #0d1020 50%, #141735); min-height: 100vh; display: grid; place-items: center; }
+        .card { width: min(460px, calc(100vw - 22px)); background: var(--panel); border-radius: 20px; border: 1px solid var(--line); padding: 24px; box-shadow: 0 14px 40px rgba(0,0,0,.36); color: var(--ink); }
+        .brand { margin: 0 0 10px; color: var(--blue); letter-spacing: .22em; text-transform: uppercase; font-size: 12px; }
         h1 { margin: 0 0 8px; font-size: 34px; }
-        p { margin: 0 0 14px; color: #5b6770; }
-        label { display: block; margin-bottom: 4px; font-size: 12px; text-transform: uppercase; color: #5b6770; }
-        input { width: 100%; padding: 10px 11px; border-radius: 9px; border: 1px solid #d6dee5; margin-bottom: 12px; }
-        button { width: 100%; border: 0; border-radius: 9px; padding: 11px; font-weight: 700; background: #0f766e; color: #fff; cursor: pointer; }
-        .error { color: #b7412b; margin-top: 10px; font-size: 13px; }
+        p { margin: 0 0 14px; color: var(--muted); }
+        label { display: block; margin-bottom: 4px; font-size: 12px; text-transform: uppercase; color: var(--muted); }
+        input { width: 100%; padding: 10px 11px; border-radius: 10px; border: 1px solid rgba(113,130,255,.24); background: rgba(8,10,20,.8); color: var(--ink); margin-bottom: 12px; }
+        button { width: 100%; border: 0; border-radius: 10px; padding: 11px; font-weight: 700; background: linear-gradient(135deg, var(--red), var(--purple), var(--blue)); color: #fff; cursor: pointer; }
+        .error { color: #ff8ca1; margin-top: 10px; font-size: 13px; }
+        .signup-link { text-align: center; margin-top: 14px; font-size: 13px; color: var(--muted); }
+        .signup-link a { color: var(--blue); text-decoration: none; }
     </style>
 </head>
 <body>
     <main class="card">
+        <p class="brand">StreetWise</p>
         <h1>Client Login</h1>
-        <p>Sign in to redeem purchase tokens and manage API keys.</p>
+        <p>Sign in to activate access, redeem purchase keys, and manage your StreetWise account.</p>
         <label for="email">Email</label>
         <input id="email" type="email" placeholder="you@company.com" />
         <label for="password">Password</label>
         <input id="password" type="password" placeholder="********" />
         <button id="login">Sign In</button>
         <div class="error" id="error"></div>
+        <div class="signup-link">Don&rsquo;t have an account? <a href="/signup">Sign up free</a></div>
     </main>
     <script>
         const errorEl = document.getElementById('error');
@@ -3762,39 +4175,40 @@ def render_client_portal_html():
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Client Portal</title>
+    <title>StreetWise Portal</title>
     <style>
-        body { margin: 0; font-family: Segoe UI, sans-serif; background: #f5f1e8; color: #1f2a2d; }
+        body { margin: 0; font-family: Segoe UI, sans-serif; background: linear-gradient(160deg,#070812,#0d1020 50%,#141735); color: #f4f7ff; }
         .shell { width: min(1100px, calc(100vw - 24px)); margin: 20px auto 28px; display: grid; gap: 12px; }
-        .panel { background: #fff; border: 1px solid #ded8cb; border-radius: 12px; padding: 14px; }
+        .panel { background: rgba(14,16,28,.88); border: 1px solid rgba(113,130,255,.18); border-radius: 16px; padding: 14px; box-shadow: 0 16px 40px rgba(0,0,0,.28); }
         .head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
         h1,h2 { margin: 0; }
-        .muted { color: #5f6b66; font-size: 13px; }
-        input { width: 100%; border: 1px solid #d7dfd4; border-radius: 8px; padding: 10px; margin-top: 5px; }
+        a { color: #4da3ff; }
+        .muted { color: #aab4d4; font-size: 13px; }
+        input { width: 100%; border: 1px solid rgba(113,130,255,.24); background: rgba(8,10,20,.8); color: #f4f7ff; border-radius: 10px; padding: 10px; margin-top: 5px; }
         button { border: 0; border-radius: 8px; padding: 10px 12px; font-weight: 700; cursor: pointer; }
-        .main { background: #0f766e; color: #fff; }
-        .warn { background: #ece7dc; color: #1f2a2d; }
+        .main { background: linear-gradient(135deg, #ff4d6d, #9b5cff, #4da3ff); color: #fff; }
+        .warn { background: rgba(255,255,255,.08); color: #f4f7ff; }
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th, td { text-align: left; padding: 8px; border-top: 1px solid #ece8df; }
-        th { text-transform: uppercase; letter-spacing: 0.08em; font-size: 11px; color: #5f6b66; }
+        th, td { text-align: left; padding: 8px; border-top: 1px solid rgba(113,130,255,.12); }
+        th { text-transform: uppercase; letter-spacing: 0.08em; font-size: 11px; color: #aab4d4; }
         .mono { font-family: Consolas, Monaco, monospace; font-size: 12px; }
-        .result { margin-top: 10px; padding: 10px; border-radius: 8px; background: #edf8f6; border: 1px solid #c8e7e1; }
-        .error { color: #b7412b; font-size: 13px; margin-top: 8px; }
+        .result { margin-top: 10px; padding: 10px; border-radius: 10px; background: rgba(77,163,255,.08); border: 1px solid rgba(77,163,255,.18); }
+        .error { color: #ff8ca1; font-size: 13px; margin-top: 8px; }
     </style>
 </head>
 <body>
     <main class="shell">
         <section class="panel head">
             <div>
-                <h1>Client Portal</h1>
+                <h1>StreetWise Portal</h1>
                 <p class="muted" id="who">Loading account...</p>
             </div>
             <button id="logout" class="warn">Logout</button>
         </section>
 
         <section class="panel">
-            <h2>Redeem Purchase Token</h2>
-            <p class="muted">Redeem a payment token from your receipt to activate plan access and generate a new API key.</p>
+            <h2>Redeem Access Key</h2>
+            <p class="muted">Redeem a one-time activation key to unlock your StreetWise plan and generate a fresh API key.</p>
             <label>Purchase Token<input id="purchase-token" placeholder="pay_..." /></label>
             <label>Key Label<input id="key-label" value="purchased-key" /></label>
             <button id="redeem" class="main">Redeem and Generate Key</button>
@@ -3805,7 +4219,7 @@ def render_client_portal_html():
         <section class="panel">
             <h2>Your API Keys</h2>
             <p class="muted">Rotate keys regularly. Revoke any key you no longer trust.</p>
-            <p><a href="/client/restaurant">Open Restaurant Analytics</a></p>
+            <p><a href="/client/restaurant">Open StreetWise Restaurant View</a></p>
             <label>Rotate Key Label<input id="rotate-label" value="rotated-key" /></label>
             <label><input id="rotate-deactivate" type="checkbox" checked /> Deactivate existing active keys when rotating</label>
             <button id="rotate" class="main">Rotate API Key</button>
@@ -3933,34 +4347,84 @@ def render_restaurant_analytics_html():
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Restaurant Analytics</title>
+    <title>StreetWise Restaurant View</title>
     <style>
         :root {
-            --bg: #f5efe4;
-            --panel: #fff8ee;
-            --line: #e5dccf;
-            --ink: #1f2a2d;
-            --muted: #5f6b66;
-            --accent: #0f766e;
-            --good: #1f7a3d;
-            --warn: #b8691c;
-            --bad: #b7412b;
+            --bg: #070812;
+            --panel: rgba(14, 16, 28, 0.88);
+            --line: rgba(113,130,255,.18);
+            --ink: #f4f7ff;
+            --muted: #aab4d4;
+            --accent: #4da3ff;
+            --good: #3ddc97;
+            --warn: #ffb347;
+            --bad: #ff4d6d;
         }
         * { box-sizing: border-box; }
         body {
             margin: 0;
             font-family: "Palatino Linotype", "Book Antiqua", Palatino, serif;
             color: var(--ink);
-            background: radial-gradient(circle at 10% -10%, rgba(15, 118, 110, 0.2), transparent 45%), var(--bg);
+            padding-top: 46px;
+            background: radial-gradient(circle at 10% -10%, rgba(255, 77, 109, 0.16), transparent 45%), radial-gradient(circle at 90% 0%, rgba(77,163,255,.14), transparent 42%), linear-gradient(160deg,#070812,#0d1020 50%,#141735);
+        }
+        .ticker-banner {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 50;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border-bottom: 1px solid rgba(255, 77, 109, 0.34);
+            background: linear-gradient(90deg, rgba(255,77,109,.18), rgba(77,163,255,.14), rgba(155,92,255,.14));
+            backdrop-filter: blur(8px);
+            overflow: hidden;
+        }
+        .ticker-label {
+            flex: 0 0 auto;
+            margin-left: 10px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,.25);
+            font-size: 11px;
+            letter-spacing: .12em;
+            text-transform: uppercase;
+            color: #ffd6df;
+            background: rgba(16, 20, 38, 0.58);
+        }
+        .ticker-viewport {
+            position: relative;
+            min-width: 0;
+            flex: 1;
+            overflow: hidden;
+            height: 20px;
+        }
+        .ticker-run {
+            position: absolute;
+            white-space: nowrap;
+            font-size: 13px;
+            color: #f4f7ff;
+            will-change: transform;
+            animation: ticker-scroll 32s linear infinite;
+        }
+        .ticker-run:hover {
+            animation-play-state: paused;
+        }
+        @keyframes ticker-scroll {
+            0% { transform: translateX(100%); }
+            100% { transform: translateX(-100%); }
         }
         .shell { width: min(980px, calc(100vw - 28px)); margin: 24px auto 40px; display: grid; gap: 14px; }
-        .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 16px; }
+        .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 16px; box-shadow: 0 16px 40px rgba(0,0,0,.28); }
         .head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
         h1 { margin: 0; font-size: clamp(32px, 5vw, 54px); line-height: 0.92; }
         p { margin: 6px 0; }
         .muted { color: var(--muted); }
         .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-        .metric { border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: #fffdf7; }
+        .metric { border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: rgba(20,24,40,.92); }
         .metric h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); }
         .metric p { margin: 0; font-size: 38px; line-height: 0.95; }
         .tag { display: inline-block; padding: 6px 10px; border-radius: 999px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
@@ -3980,12 +4444,19 @@ def render_restaurant_analytics_html():
     </style>
 </head>
 <body>
+    <div class="ticker-banner" aria-live="polite">
+        <span class="ticker-label">Incident Feed</span>
+        <div class="ticker-viewport">
+            <div id="incident-ticker" class="ticker-run"></div>
+        </div>
+    </div>
+
     <main class="shell">
         <section class="panel">
             <div class="head">
                 <div>
-                    <h1>Restaurant Analytics</h1>
-                    <p class="muted">Simple live interpretation for food trucks/carts and restaurants.</p>
+                    <h1>StreetWise Restaurant View</h1>
+                    <p class="muted">Live operating interpretation for food trucks, carts, and street-vendor teams.</p>
                 </div>
                 <div>
                     <a href="/client">Back to Client Portal</a>
@@ -4048,6 +4519,7 @@ def render_restaurant_analytics_html():
         const confidenceEl = document.getElementById('confidence');
         const updatedAtEl = document.getElementById('updated-at');
         const errorEl = document.getElementById('error');
+        const incidentTickerEl = document.getElementById('incident-ticker');
 
         function fmtDate(v) {
             if (!v) return 'n/a';
@@ -4069,6 +4541,41 @@ def render_restaurant_analytics_html():
         function listHtml(items) {
             if (!items || !items.length) return '<li>n/a</li>';
             return items.map((i) => `<li>${i}</li>`).join('');
+        }
+
+        function fmtIncident(item) {
+            const kind = String(item.kind || 'event').toUpperCase();
+            const headline = String(item.headline || '').trim();
+            const where = item.location ? ` @ ${item.location}` : '';
+            const when = item.happened_at ? ` (${fmtDate(item.happened_at)})` : '';
+            return `[${kind}] ${headline}${where}${when}`;
+        }
+
+        async function loadIncidentTicker() {
+            try {
+                const resp = await fetch('/v1/client/incidents-ticker?limit=18');
+                const payload = await resp.json();
+                if (!resp.ok) {
+                    if (resp.status === 401) {
+                        window.location.href = '/client/login';
+                        return;
+                    }
+                    throw new Error(payload.detail || 'Failed to load incident feed');
+                }
+
+                const items = Array.isArray(payload.items) ? payload.items : [];
+                if (!items.length) {
+                    const emptyText = 'No active traffic or weather incidents in the last 24 hours.';
+                    incidentTickerEl.textContent = `${emptyText}  •  ${emptyText}`;
+                    return;
+                }
+
+                const text = items.map(fmtIncident).join('  •  ');
+                incidentTickerEl.textContent = `${text}  •  ${text}`;
+            } catch (err) {
+                const unavailableText = 'Incident feed temporarily unavailable. Retrying shortly.';
+                incidentTickerEl.textContent = `${unavailableText}  •  ${unavailableText}`;
+            }
         }
 
         async function loadInsights() {
@@ -4102,7 +4609,9 @@ def render_restaurant_analytics_html():
         }
 
         loadInsights();
+        loadIncidentTicker();
         setInterval(loadInsights, 60000);
+        setInterval(loadIncidentTicker, 120000);
     </script>
 </body>
 </html>
@@ -4121,7 +4630,7 @@ def _secure_cookies() -> bool:
         return False
 
 
-app = FastAPI(title="Public Data API", version="0.1.0")
+app = FastAPI(title="StreetWise API", version="0.1.0")
 
 
 @app.on_event("startup")
@@ -4158,6 +4667,11 @@ def client_login_page():
     return render_client_login_html()
 
 
+@app.get("/signup", response_class=HTMLResponse)
+def signup_page():
+    return render_signup_html()
+
+
 @app.get("/client", response_class=HTMLResponse)
 def client_page():
     return render_client_portal_html()
@@ -4181,6 +4695,13 @@ def who_am_i(context=Depends(get_request_context)):
 @app.get("/v1/dashboard/summary")
 def dashboard_summary(context=Depends(get_request_context)):
     return build_dashboard_summary(context)
+
+
+@app.get("/v1/dashboard/incidents-ticker")
+def dashboard_incident_ticker(limit: int = 20, context=Depends(get_request_context)):
+    _ = context
+    bounded_limit = max(5, min(int(limit or 20), 50))
+    return fetch_incident_ticker_items(limit=bounded_limit)
 
 
 @app.get("/v1/dashboard/trends")
@@ -4324,6 +4845,11 @@ def client_login(payload: LoginPayload, response: Response):
     }
 
 
+@app.post("/v1/auth/signup")
+def auth_signup(payload: SignupPayload):
+    return signup_client(payload)
+
+
 @app.post("/v1/client/logout")
 def client_logout(response: Response, client_session: str = Cookie(default=None)):
     revoke_session(client_session, "client_sessions")
@@ -4339,6 +4865,13 @@ def client_me(context=Depends(get_client_context)):
 @app.get("/v1/client/restaurant-insights")
 def client_restaurant_insights(context=Depends(get_client_context)):
     return fetch_restaurant_operations_insight(context)
+
+
+@app.get("/v1/client/incidents-ticker")
+def client_incident_ticker(limit: int = 20, context=Depends(get_client_context)):
+    _ = context
+    bounded_limit = max(5, min(int(limit or 20), 50))
+    return fetch_incident_ticker_items(limit=bounded_limit)
 
 
 @app.post("/v1/client/redeem-token")
